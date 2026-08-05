@@ -40,13 +40,22 @@ struct DownloadInfo {
     int uploadSpeed = 0;
 };
 
+struct AddDownloadInfo {
+    std::string url;
+    std::string folderPath;
+};
+
+
 aria2::Session *session;
 std::mutex dhsMutex;
 std::vector<DownloadInfo> dhs;
 aria2::GlobalStat gstat;
 
+// Store the last selected download folder
+std::string downloadFolder = ".";
+
 std::mutex uriQueueMutex;
-std::queue<std::string> pendingUris;
+std::queue<AddDownloadInfo> pendingUris;
 std::atomic<bool> keepRunning{true};
 
 inline void rtrim(std::string &s) {
@@ -110,14 +119,15 @@ void doAria2() {
         {
             std::lock_guard<std::mutex> lock(uriQueueMutex);
             while (!pendingUris.empty()) {
-                std::string uri = pendingUris.front();
+                AddDownloadInfo adi = pendingUris.front();
                 pendingUris.pop();
 
-                std::vector<std::string> uris = {uri};
+                std::vector<std::string> uris = {adi.url};
                 aria2::KeyVals options;
+                options.push_back(std::pair<std::string, std::string> ("dir", adi.folderPath));
                 rv = aria2::addUri(session, nullptr, uris, options);
                 if (rv < 0) {
-                    std::cerr << "Failed to add download: " << uri << std::endl;
+                    std::cerr << "Failed to add download: " << adi.url << std::endl;
                 }
             }
         }
@@ -281,42 +291,163 @@ int main() {
             int y = 0;
             SDL_GetWindowSize(window, &x, &y);
             ImGui::SetWindowSize({(float) x, (float) y});
-            ImGui::Text("Please enter your name: ");
-            ImGui::InputTextWithHint("##", "Name", name, sizeof name);
+            ImGui::Text("Download Settings:");
+            
+            // Show current download folder with change button
+            // {
+            //     ImGui::PushID("folder_display");
+            //     ImGui::TextColored(ImVec4(0.5f, 0.6f, 0.5f, 1.0f), "Download folder: %s", downloadFolder.c_str());
+            //     if (ImGui::Button("Change folder")) {
+            //         std::string folder_path = exec("zenity --file-selection --directory");
+            //         if (!folder_path.empty()) {
+            //             std::string folder_name = folder_path;
+            //             for (int i = folder_path.size() - 1; i >= 0; --i) {
+            //                 if (folder_path[i] == '/' || folder_path[i] == '\\') {
+            //                     folder_name = folder_path.substr(i + 1, folder_path.size() - i - 1);
+            //                     break;
+            //                 }
+            //             }
+            //             downloadFolder = folder_path;
+            //             std::cout << "New folder: " << downloadFolder << std::endl;
+            //         }
+            //     }
+            //     ImGui::PopID();
+            // }
 
-            if (ImGui::Button("Pick a file")) {
-                std::string file_path = exec("zenity --file-selection");
-                std::cout << file_path;
-                std::string file_buffer;
-                std::ifstream the_file(file_path);
-                std::cout << the_file.is_open();
-                while (getline(the_file, file_buffer)) {
-                    content += file_buffer;
-                    content += "\n";
+            // URL input field
+            ImGui::InputText("##url", name, sizeof name);
+            ImGui::SetItemTooltip("Enter URL to download");
+
+            if (ImGui::Button("Pick download folder")) {
+                std::string folder_path = exec("zenity --file-selection --directory");
+                if (!folder_path.empty()) {
+                    downloadFolder = folder_path;
                 }
-                for (int i = file_path.size() - 1; i > 0 ; --i) {
-                    if (file_path[i] == '/') {
-                        std::string name = file_path.substr(i + 1, file_path.size() - i + 1);
-                        std::cout << name << std::endl;
-                        break;
-                    }
-                }
+                std::cout << "Selected folder: " << folder_path << std::endl;
             }
 
             if (ImGui::Button("Download")) {
-                std::cout << name << std::endl;
-                std::lock_guard<std::mutex> lock(uriQueueMutex);
-                pendingUris.push(name);
+                if (strlen(name) > 0) {
+                    // Get the download folder path
+                    std::string folder_path = downloadFolder;
+                    
+                    std::cout << "Downloading: " << name << std::endl;
+                    // Add to download queue with full path
+                    std::lock_guard<std::mutex> lock(uriQueueMutex);
+                    AddDownloadInfo aid = {
+                        .url = name,
+                        .folderPath = downloadFolder
+                    };
+                    pendingUris.push(aid);
+                    name[0] = '\0';
+                } else {
+                    ImGui::TextColored(ImVec4(0.8f, 0.3f, 0.3f, 1.0f), "Please enter a URL first");
+                }
             }
 
-            // Safely render download details from shared state
+            // Beautiful download manager display with folder info
             {
                 std::lock_guard<std::mutex> lock(dhsMutex);
-                for (const auto &info : dhs) {
-                    ImGui::Text("[%s] Dir: %s | Speed: %d KiB/s", 
-                                info.gid.c_str(), 
-                                info.dir.c_str(), 
-                                info.downloadSpeed / 1024);
+                if (dhs.empty()) {
+                    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "No active downloads");
+                    // Show current download folder
+                    ImGui::TextColored(ImVec4(0.4f, 0.6f, 0.4f, 1.0f), "Download folder: %s", downloadFolder.c_str());
+                } else {
+                    ImGui::Separator();
+                    ImGui::Text("Downloads (%d)", dhs.size());
+                    ImGui::Separator();
+                    // Show download folder
+                    ImGui::TextColored(ImVec4(0.4f, 0.6f, 0.4f, 1.0f), "Saving to: %s", downloadFolder.c_str());
+
+                    for (const auto &info : dhs) {
+                        // Download card header with status
+                        {
+                            ImGui::PushID(info.gid.c_str());
+                            
+                            // Status color based on speed
+                            ImVec4 statusColor;
+                            int speed = info.downloadSpeed / 1024;
+                            if (speed > 100) {
+                                statusColor = ImVec4(0.2f, 0.8f, 0.9f, 1.0f); // Fast - cyan
+                            } else if (speed > 10) {
+                                statusColor = ImVec4(0.3f, 0.7f, 0.5f, 1.0f); // Normal - green
+                            } else {
+                                statusColor = ImVec4(0.8f, 0.5f, 0.3f, 1.0f); // Slow - orange
+                            }
+                            
+                            ImGui::TextColored(statusColor, "%s", info.gid.c_str());
+                            
+                            // Progress bar
+                            float progress = (float)info.completedLength / info.totalLength;
+                            if (info.totalLength > 0) {
+                                ImGui::ProgressBar(progress, ImVec2(-1, 20));
+                            }
+                            
+                            ImGui::PopID();
+                        }
+                        
+                        // Detailed info row
+                        {
+                            ImGui::PushID(info.gid.c_str());
+                            
+                            // Calculate download speed display
+                            int speed_kib = info.downloadSpeed / 1024;
+                            char speedStr[32];
+                            if (speed_kib >= 1000) {
+                                snprintf(speedStr, sizeof(speedStr), "%.2f MB/s", speed_kib / 1000.0f);
+                            } else if (speed_kib > 0) {
+                                snprintf(speedStr, sizeof(speedStr), "%d KiB/s", speed_kib);
+                            } else {
+                                snprintf(speedStr, sizeof(speedStr), "0 KiB/s");
+                            }
+                            
+                            // Time remaining estimate
+                            char timeStr[32];
+                            if (info.totalLength > info.completedLength) {
+                                double remaining = info.totalLength - info.completedLength;
+                                double speed = info.downloadSpeed / 1024.0;
+                                if (speed > 0) {
+                                    double seconds = remaining / speed;
+                                    if (seconds >= 3600) {
+                                        snprintf(timeStr, sizeof(timeStr), "~ %d hr", (int)(seconds / 3600));
+                                    } else if (seconds >= 60) {
+                                        snprintf(timeStr, sizeof(timeStr), "~ %d min", (int)(seconds / 60));
+                                    } else {
+                                        snprintf(timeStr, sizeof(timeStr), "~ %d sec", (int)seconds);
+                                    }
+                                } else {
+                                    snprintf(timeStr, sizeof(timeStr), "Paused");
+                                }
+                            } else {
+                                snprintf(timeStr, sizeof(timeStr), "Complete");
+                            }
+                            
+                            // Main info line
+                            ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), 
+                                             "  %s | %s | %s", 
+                                             timeStr,
+                                             speedStr,
+                                             info.dir.c_str());
+                            
+                            ImGui::PopID();
+                        }
+                        
+                        // Progress details
+                        {
+                            ImGui::PushID(info.gid.c_str());
+                            
+                            char percentStr[32];
+                            float percent = (float)info.completedLength / info.totalLength * 100.0f;
+                            snprintf(percentStr, sizeof(percentStr), "%.1f%%", percent);
+                            
+                            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
+                                             "  Progress: %s / %lld bytes", 
+                                             percentStr,
+                                             (long long)info.totalLength);
+                            
+                            ImGui::PopID();
+                        }
+                    }
                 }
             }
 
