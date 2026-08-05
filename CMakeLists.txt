@@ -42,11 +42,13 @@ target_include_directories(agui PRIVATE
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(ARIA2 REQUIRED IMPORTED_TARGET libaria2)
 pkg_check_modules(SDL3 REQUIRED IMPORTED_TARGET sdl3)
+pkg_check_modules(APPINDICATOR REQUIRED IMPORTED_TARGET appindicator3-0.1 gtk+-3.0)
 find_package(OpenGL REQUIRED)
 
 target_link_libraries(agui PRIVATE
     PkgConfig::ARIA2
     PkgConfig::SDL3
+    PkgConfig::APPINDICATOR
     OpenGL::GL
     ${CMAKE_DL_LIBS}
 )

@@ -16,6 +16,9 @@
 #include "../libs/emscripten/emscripten_mainloop_stub.h"
 #endif
 
+#include <gtk-3.0/gtk/gtk.h>
+#include <libappindicator3-0.1/libappindicator/app-indicator.h>
+
 #include <chrono>
 #include <iostream>
 #include <fstream>
@@ -57,6 +60,9 @@ std::string downloadFolder = ".";
 std::mutex uriQueueMutex;
 std::queue<AddDownloadInfo> pendingUris;
 std::atomic<bool> keepRunning{true};
+
+bool done = false;
+
 
 inline void rtrim(std::string &s) {
     s.erase(std::find_if(s.rbegin(), s.rend(), [](unsigned char ch) {
@@ -179,7 +185,14 @@ void doAria2() {
     aria2::libraryDeinit();
 }
 
-int main() {
+static void on_quit(GtkMenuItem*, gpointer) {
+    done = true;
+    gtk_main_quit();
+}
+
+
+
+int main(int argc, char **argv) {
     int rv = 0;
     aria2::libraryInit();
 
@@ -257,7 +270,29 @@ int main() {
     style.FontSizeBase = 20.0f;
     io.Fonts->AddFontFromFileTTF("./InterVariable.ttf");
 
-    bool done = false;
+    // system tray
+    gtk_init(&argc, &argv);
+
+    AppIndicator* indicator = app_indicator_new(
+        "myapp",
+        "folder-download-symbolic",
+        APP_INDICATOR_CATEGORY_APPLICATION_STATUS
+    );
+
+    app_indicator_set_status(indicator, APP_INDICATOR_STATUS_ACTIVE);
+
+    GtkWidget* menu = gtk_menu_new();
+
+    GtkWidget* quit_item = gtk_menu_item_new_with_label("Quit");
+    g_signal_connect(quit_item, "activate", G_CALLBACK(on_quit), nullptr);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), quit_item);
+
+    gtk_widget_show_all(menu);
+    app_indicator_set_menu(indicator, GTK_MENU(menu));
+
+    std::thread gtkApp(gtk_main);
+    
+
     bool show_demo_window = false;
     bool show_my_window = true;
     ImVec4 clear_color = ImVec4(0.0f, 0.0f, 0.0f, 1.00f);
