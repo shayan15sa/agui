@@ -162,7 +162,7 @@ void doAria2() {
                 if (dh) {
                     DownloadInfo info;
                     info.gid = aria2::gidToHex(gid);
-                    info.dir = dh->getDir();
+                    info.dir = dh->getFiles()[0].path;
                     info.completedLength = dh->getCompletedLength();
                     info.totalLength = dh->getTotalLength();
                     info.downloadSpeed = dh->getDownloadSpeed();
@@ -363,11 +363,9 @@ int main(int argc, char **argv) {
 
             if (ImGui::Button("Download")) {
                 if (strlen(name) > 0) {
-                    // Get the download folder path
                     std::string folder_path = downloadFolder;
                     
                     std::cout << "Downloading: " << name << std::endl;
-                    // Add to download queue with full path
                     std::lock_guard<std::mutex> lock(uriQueueMutex);
                     AddDownloadInfo aid = {
                         .url = name,
@@ -380,26 +378,21 @@ int main(int argc, char **argv) {
                 }
             }
 
-            // Beautiful download manager display with folder info
             {
                 std::lock_guard<std::mutex> lock(dhsMutex);
                 if (dhs.empty()) {
                     ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "No active downloads");
-                    // Show current download folder
                     ImGui::TextColored(ImVec4(0.4f, 0.6f, 0.4f, 1.0f), "Download folder: %s", downloadFolder.c_str());
                 } else {
                     ImGui::Separator();
                     ImGui::Text("Downloads (%d)", dhs.size());
                     ImGui::Separator();
-                    // Show download folder
                     ImGui::TextColored(ImVec4(0.4f, 0.6f, 0.4f, 1.0f), "Saving to: %s", downloadFolder.c_str());
 
                     for (const auto &info : dhs) {
-                        // Download card header with status
                         {
                             ImGui::PushID(info.gid.c_str());
                             
-                            // Status color based on speed
                             ImVec4 statusColor;
                             int speed = info.downloadSpeed / 1024;
                             if (speed > 100) {
@@ -409,10 +402,18 @@ int main(int argc, char **argv) {
                             } else {
                                 statusColor = ImVec4(0.8f, 0.5f, 0.3f, 1.0f); // Slow - orange
                             }
+
+                            const char *file_name = info.dir.c_str();
+
+                            int last_slash = 0;
+                            for (int i = 0; file_name[i] != '\0'; ++i) {
+                                if (file_name[i] == '/') {
+                                    last_slash = i;
+                                }
+                            }
                             
-                            ImGui::TextColored(statusColor, "%s", info.gid.c_str());
+                            ImGui::TextColored(statusColor, "%s", (file_name + last_slash + 1));
                             
-                            // Progress bar
                             float progress = (float)info.completedLength / info.totalLength;
                             if (info.totalLength > 0) {
                                 ImGui::ProgressBar(progress, ImVec2(-1, 20));
@@ -421,11 +422,10 @@ int main(int argc, char **argv) {
                             ImGui::PopID();
                         }
                         
-                        // Detailed info row
+
                         {
                             ImGui::PushID(info.gid.c_str());
                             
-                            // Calculate download speed display
                             int speed_kib = info.downloadSpeed / 1024;
                             char speedStr[32];
                             if (speed_kib >= 1000) {
@@ -436,20 +436,16 @@ int main(int argc, char **argv) {
                                 snprintf(speedStr, sizeof(speedStr), "0 KiB/s");
                             }
                             
-                            // Time remaining estimate
                             char timeStr[32];
                             if (info.totalLength > info.completedLength) {
                                 double remaining = info.totalLength - info.completedLength;
-                                double speed = info.downloadSpeed / 1024.0;
-                                if (speed > 0) {
-                                    double seconds = remaining / speed;
-                                    if (seconds >= 3600) {
-                                        snprintf(timeStr, sizeof(timeStr), "~ %d hr", (int)(seconds / 3600));
-                                    } else if (seconds >= 60) {
-                                        snprintf(timeStr, sizeof(timeStr), "~ %d min", (int)(seconds / 60));
-                                    } else {
-                                        snprintf(timeStr, sizeof(timeStr), "~ %d sec", (int)seconds);
-                                    }
+                                
+                                if (info.downloadSpeed > 0) {
+                                    double seconds = remaining / info.downloadSpeed;
+                                    int hours = (int)(seconds / 3600);
+                                    int mins = (int)((seconds - (hours * 3600)) / 60);
+                                    int secs = (int)(seconds - (mins * 60));
+                                    snprintf(timeStr, sizeof(timeStr), "Remaining: %02d:%02d:%02d", hours, mins, secs);
                                 } else {
                                     snprintf(timeStr, sizeof(timeStr), "Paused");
                                 }
