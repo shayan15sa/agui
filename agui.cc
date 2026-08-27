@@ -3,6 +3,7 @@
 #include "imgui_impl_sdl3.h"
 #include <SDL3/SDL.h>
 #include <queue>
+#include <deque>
 #include <stdio.h>
 #include <thread>
 #include <mutex>
@@ -23,183 +24,1346 @@
 #include <iostream>
 #include <fstream>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
-#include <algorithm> 
+#include <algorithm>
 #include <cctype>
+#include <sstream>
 #include <string>
 #include <array>
 #include <atomic>
 #include <vector>
+#include <unordered_map>
+#include <unordered_set>
+#include <filesystem>
+#include <cfloat>
+
 #include <aria2/aria2.h>
 
-// Struct to safely store snapshot data without lifetime or dangling pointer issues
+// Font from c files
+#include "Inter.cpp"
+#include "FaSolid.cpp"
+
+// ============================================================================
+// FontAwesome 6 Free Solid glyphs (vendor/fonts/fa-solid-900.ttf)
+// ============================================================================
+
+#define ICON_FA_DOWNLOAD              "\xef\x80\x99" // U+F019
+#define ICON_FA_ARROW_UP              "\xef\x81\xa2" // U+F062
+#define ICON_FA_ARROW_DOWN            "\xef\x81\xa3" // U+F063
+#define ICON_FA_PAUSE                 "\xef\x81\x8c" // U+F04C
+#define ICON_FA_PLAY                  "\xef\x81\x8b" // U+F04B
+#define ICON_FA_XMARK                 "\xef\x80\x8d" // U+F00D
+#define ICON_FA_CHECK                 "\xef\x80\x8c" // U+F00C
+#define ICON_FA_CIRCLE_CHECK          "\xef\x81\x98" // U+F058
+#define ICON_FA_TRIANGLE_EXCLAMATION  "\xef\x81\xb1" // U+F071
+#define ICON_FA_FOLDER                "\xef\x81\xbb" // U+F07B
+#define ICON_FA_FOLDER_OPEN           "\xef\x81\xbc" // U+F07C
+#define ICON_FA_PASTE                 "\xef\x83\xaa" // U+F0EA
+#define ICON_FA_CLOCK                 "\xef\x80\x97" // U+F017
+#define ICON_FA_TRASH                 "\xef\x87\xb8" // U+F1F8
+#define ICON_FA_OPEN_EXTERNAL         "\xef\x82\x8e" // U+F08E
+#define ICON_FA_WINDOW_MINIMIZE       "\xef\x8b\x91" // U+F2D1
+#define ICON_FA_POWER_OFF             "\xef\x80\x91" // U+F011
+
+// ============================================================================
+// Small string/format helpers
+// ============================================================================
+
+static std::string baseNameOf(const std::string& path) {
+    size_t pos = path.find_last_of('/');
+    if (pos == std::string::npos) return path;
+    return path.substr(pos + 1);
+}
+
+static std::string displayNameFromUrl(const std::string& url) {
+    size_t schemeEnd = url.find("://");
+    std::string rest = (schemeEnd == std::string::npos) ? url : url.substr(schemeEnd + 3);
+    size_t slash = rest.find('/');
+    std::string host = (slash == std::string::npos) ? rest : rest.substr(0, slash);
+    std::string path = (slash == std::string::npos) ? "" : rest.substr(slash + 1);
+    size_t cut = path.find_first_of("?#");
+    if (cut != std::string::npos) path = path.substr(0, cut);
+    std::string name = baseNameOf(path);
+    if (name.empty()) name = host;
+    return name;
+}
+
+static std::string directoryOf(const std::string& path) {
+    size_t pos = path.find_last_of('/');
+    if (pos == std::string::npos) return ".";
+    if (pos == 0) return "/";
+    return path.substr(0, pos);
+}
+
+static std::string fmtBytes(int64_t bytes) {
+    if (bytes <= 0) return "0 B";
+    static const char* units[] = {"B", "KB", "MB", "GB", "TB"};
+    double v = (double)bytes;
+    int u = 0;
+    while (v >= 1000.0 && u < 4) { v /= 1000.0; ++u; }
+    char buf[32];
+    snprintf(buf, sizeof(buf), u == 0 ? "%.0f %s" : "%.1f %s", v, units[u]);
+    return buf;
+}
+
+static std::string fmtSpeed(int64_t bytesPerSec) {
+    if (bytesPerSec <= 0) return "0 B/s";
+    return fmtBytes(bytesPerSec) + "/s";
+}
+
+static std::string fmtETA(double seconds) {
+    if (seconds < 0 || seconds > 86400.0 * 30.0) return "--";
+    if (seconds >= 3600.0) {
+        int h = (int)(seconds / 3600);
+        int m = (int)((seconds - h * 3600) / 60);
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%dh %02dm", h, m);
+        return buf;
+    }
+    if (seconds >= 60.0) {
+        int m = (int)(seconds / 60);
+        int s = (int)(seconds - m * 60);
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%dm %02ds", m, s);
+        return buf;
+    }
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%ds", std::max(1, (int)seconds));
+    return buf;
+}
+
+static std::string shellQuote(const std::string& s) {
+    std::string r = "'";
+    for (char ch : s) {
+        if (ch == '\'') r += "'\\''";
+        else r += ch;
+    }
+    r += "'";
+    return r;
+}
+
+static std::string errorString(int code) {
+    switch (code) {
+    case 0:  return "";
+    case 1:  return "Unknown error";
+    case 2:  return "Timed out";
+    case 3:  return "Resource not found";
+    case 4:  return "Multiple errors";
+    case 5:  return "Resume not supported";
+    case 6:  return "Range not supported";
+    case 7:  return "Authentication failed";
+    default: {
+        char buf[48];
+        snprintf(buf, sizeof(buf), "Error code %d", code);
+        return buf;
+    }
+    }
+}
+
+// Fire-and-forget shell command on a detached thread.
+static void spawnShell(const std::string& cmd) {
+    std::thread([cmd] { int rc = std::system(cmd.c_str()); (void)rc; }).detach();
+}
+
+static void desktopNotify(const std::string& title, const std::string& msg) {
+    spawnShell("command -v notify-send >/dev/null 2>&1 && notify-send " +
+               shellQuote(title) + " " + shellQuote(msg));
+}
+
+static void openWithXdg(const std::string& target) {
+    spawnShell("command -v xdg-open >/dev/null 2>&1 && xdg-open " + shellQuote(target));
+}
+
+// ============================================================================
+// Shared data model (guarded by g_dlMutex)
+// ============================================================================
+
 struct DownloadInfo {
     std::string gid;
-    std::string dir;
+    std::string name;   // display name (file basename, derived from URL as fallback)
+    std::string path;   // full path of first file, may be empty early on
+    std::string url;    // source URL
     int64_t completedLength = 0;
     int64_t totalLength = 0;
     int downloadSpeed = 0;
     int uploadSpeed = 0;
+    aria2::DownloadStatus status = aria2::DOWNLOAD_WAITING;
+    int errorCode = 0;
 };
+
+enum class CmdType { Pause, Resume, Remove, PauseAll, ResumeAll };
+struct Command { CmdType type; std::string gid; };
 
 struct AddDownloadInfo {
     std::string url;
     std::string folderPath;
 };
 
+static aria2::Session* g_session = nullptr;
 
-aria2::Session *session;
-std::mutex dhsMutex;
-std::vector<DownloadInfo> dhs;
-aria2::GlobalStat gstat;
+static std::mutex g_dlMutex;
+static std::unordered_map<std::string, DownloadInfo> g_downloads;
+static std::vector<std::string> g_order;   // insertion order of gids
+static aria2::GlobalStat g_gstat;
 
-// Store the last selected download folder
-std::string downloadFolder = ".";
+static std::mutex g_cmdMutex;
+static std::queue<Command> g_cmds;
 
-std::mutex uriQueueMutex;
-std::queue<AddDownloadInfo> pendingUris;
-std::atomic<bool> keepRunning{true};
+static std::mutex g_uriQueueMutex;
+static std::queue<AddDownloadInfo> g_pendingUris;
 
-bool done = false;
+static std::atomic<bool> g_keepRunning{true};
 
+// Folder-picker result handoff (dialog callback thread -> UI thread)
+static std::mutex g_pickMutex;
+static bool g_folderPicked = false;
+static std::string g_pickedFolder;
 
-inline void rtrim(std::string &s) {
-    s.erase(std::find_if(s.rbegin(), s.rend(), [](unsigned char ch) {
-        return !std::isspace(ch);
-    }).base(), s.end());
+// Last used download folder (persisted)
+static std::string g_downloadFolder = ".";
+
+// Main SDL window (for parenting dialogs)
+static SDL_Window* g_window = nullptr;
+static SDL_GLContext g_gl_context = nullptr;
+static float g_main_scale = 0.0f;
+
+// ---------------------------------------------------------------------------
+// Window visibility / tray state
+//
+// The window is never destroyed while the app lives: closing it only hides it
+// so downloads keep running in the background. Tray callbacks run on the GTK
+// thread, so they only flip an atomic request that the SDL thread acts on.
+// ---------------------------------------------------------------------------
+
+static std::atomic<bool> g_done{false};          // real quit requested
+static std::atomic<bool> g_windowVisible{true};  // owned by the SDL thread
+static std::atomic<int>  g_visibilityRequest{0}; // -1 hide, +1 show, 0 none
+static std::atomic<bool> g_trayActive{false};    // tray successfully created
+
+static void requestHideWindow() { g_visibilityRequest.store(-1); }
+static void requestToggleWindow() {
+    g_visibilityRequest.store(g_windowVisible.load() ? -1 : 1);
+}
+static void requestQuit() { g_done.store(true); }
+
+static void upsertDownloadLocked(const DownloadInfo& info) {
+    if (g_downloads.count(info.gid) == 0) g_order.push_back(info.gid);
+    g_downloads[info.gid] = info;
 }
 
-std::string exec(const char* cmd) {
-    std::array<char, 128> buffer;
-    std::string result;
-    std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd, "r"), pclose);
-    if (!pipe) {
-        throw std::runtime_error("popen() failed!");
-    }
-    while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe.get()) != nullptr) {
-        result += buffer.data();
-    }
-    rtrim(result);
-    return result;
+static void eraseDownloadLocked(const std::string& gid) {
+    g_downloads.erase(gid);
+    g_order.erase(std::remove(g_order.begin(), g_order.end(), gid), g_order.end());
 }
 
-int downloadEventCallback(aria2::Session *session, aria2::DownloadEvent event,
-                          aria2::A2Gid gid, void *userData) {
+// Resolve display name preferring real file paths over URL guesses.
+static void fillFromHandle(DownloadInfo& info, aria2::DownloadHandle* dh) {
+    info.completedLength = dh->getCompletedLength();
+    info.totalLength = dh->getTotalLength();
+    info.downloadSpeed = dh->getDownloadSpeed();
+    info.uploadSpeed = dh->getUploadSpeed();
+    info.status = dh->getStatus();
+    info.errorCode = dh->getErrorCode();
+
+    if (dh->getNumFiles() > 0) {
+        aria2::FileData f = dh->getFile(1);
+        if (!f.path.empty()) info.path = f.path;
+        if (info.url.empty() && !f.uris.empty()) info.url = f.uris[0].uri;
+    }
+
+    std::string resolved;
+    if (!info.path.empty()) resolved = baseNameOf(info.path);
+    else if (!info.url.empty()) resolved = displayNameFromUrl(info.url);
+    if (!resolved.empty()) info.name = resolved;
+    if (info.name.empty()) info.name = "download-" + info.gid.substr(0, 8);
+}
+
+static void enqueueCommand(CmdType type, const std::string& gid) {
+    std::lock_guard<std::mutex> lock(g_cmdMutex);
+    g_cmds.push({type, gid});
+}
+
+// ============================================================================
+// aria2 event callback (runs on the aria2 thread, inside run())
+// ============================================================================
+
+static int downloadEventCallback(aria2::Session*, aria2::DownloadEvent event,
+                                 aria2::A2Gid gid, void* userData) {
     (void)userData;
     switch (event) {
     case aria2::EVENT_ON_DOWNLOAD_COMPLETE:
-        std::cerr << "COMPLETE";
-        break;
-    case aria2::EVENT_ON_DOWNLOAD_ERROR:
-        std::cerr << "ERROR";
-        break;
-    default:
-        return 0;
-    }
-    std::cerr << " [" << aria2::gidToHex(gid) << "] ";
-    aria2::DownloadHandle *dh = aria2::getDownloadHandle(session, gid);
-    if (!dh)
-        return 0;
-    if (dh->getNumFiles() > 0) {
-        aria2::FileData f = dh->getFile(1);
-        if (f.path.empty()) {
-            if (!f.uris.empty()) {
-                std::cerr << f.uris[0].uri;
-            }
-        } else {
-            std::cerr << f.path;
+    case aria2::EVENT_ON_DOWNLOAD_ERROR: {
+        bool failed = (event == aria2::EVENT_ON_DOWNLOAD_ERROR);
+        std::string gidStr = aria2::gidToHex(gid);
+
+        DownloadInfo info;
+        info.gid = gidStr;
+        if (aria2::DownloadHandle* dh = aria2::getDownloadHandle(g_session, gid)) {
+            fillFromHandle(info, dh);
+            aria2::deleteDownloadHandle(dh);
         }
+        if (info.name.empty()) info.name = gidStr.substr(0, 12);
+
+        {
+            std::lock_guard<std::mutex> lock(g_dlMutex);
+            upsertDownloadLocked(info);
+        }
+        desktopNotify(failed ? "Download failed" : "Download complete", info.name);
+        break;
     }
-    aria2::deleteDownloadHandle(dh);
-    std::cerr << std::endl;
+    default:
+        break;
+    }
     return 0;
 }
 
-void doAria2() {
-    int rv = 0;
-    auto start = std::chrono::steady_clock::now();
+// ============================================================================
+// aria2 worker thread
+// ============================================================================
 
-    while (keepRunning) {
-        // 1. Process queued URIs
-        {
-            std::lock_guard<std::mutex> lock(uriQueueMutex);
-            while (!pendingUris.empty()) {
-                AddDownloadInfo adi = pendingUris.front();
-                pendingUris.pop();
+static void processPendingCommands() {
+    std::vector<Command> batch;
+    {
+        std::lock_guard<std::mutex> cmdLock(g_cmdMutex);
+        while (!g_cmds.empty()) {
+            batch.push_back(g_cmds.front());
+            g_cmds.pop();
+        }
+    }
 
-                std::vector<std::string> uris = {adi.url};
-                aria2::KeyVals options;
-                options.push_back(std::pair<std::string, std::string> ("dir", adi.folderPath));
-                rv = aria2::addUri(session, nullptr, uris, options);
-                if (rv < 0) {
-                    std::cerr << "Failed to add download: " << adi.url << std::endl;
+    for (const Command& c : batch) {
+        if (c.type == CmdType::PauseAll || c.type == CmdType::ResumeAll) {
+            // Collect the affected gids from our own model: aria2 only exposes
+            // active downloads directly, and we also want queued/paused ones.
+            std::vector<std::string> gids;
+            {
+                std::lock_guard<std::mutex> lock(g_dlMutex);
+                for (const std::string& gidStr : g_order) {
+                    auto it = g_downloads.find(gidStr);
+                    if (it == g_downloads.end()) continue;
+                    aria2::DownloadStatus st = it->second.status;
+                    bool match = (c.type == CmdType::PauseAll)
+                                     ? (st == aria2::DOWNLOAD_ACTIVE || st == aria2::DOWNLOAD_WAITING)
+                                     : (st == aria2::DOWNLOAD_PAUSED);
+                    if (match) gids.push_back(gidStr);
                 }
             }
+            for (const std::string& gidStr : gids) {
+                aria2::A2Gid gid = aria2::hexToGid(gidStr);
+                if (aria2::isNull(gid)) continue;
+                if (c.type == CmdType::PauseAll) aria2::pauseDownload(g_session, gid);
+                else                             aria2::unpauseDownload(g_session, gid);
+            }
+            continue;
         }
 
-        // 2. Advance aria2 engine tick
-        rv = aria2::run(session, aria2::RUN_ONCE);
+        aria2::A2Gid gid = aria2::hexToGid(c.gid);
+        if (aria2::isNull(gid)) continue;
+        switch (c.type) {
+        case CmdType::Pause:  aria2::pauseDownload(g_session, gid); break;
+        case CmdType::Resume: aria2::unpauseDownload(g_session, gid); break;
+        case CmdType::Remove: aria2::removeDownload(g_session, gid, /*force=*/true); break;
+        default: break;
+        }
+    }
+}
+
+static void addPendingUris() {
+    std::lock_guard<std::mutex> uriLock(g_uriQueueMutex);
+    while (!g_pendingUris.empty()) {
+        AddDownloadInfo adi = g_pendingUris.front();
+        g_pendingUris.pop();
+
+        std::vector<std::string> uris = {adi.url};
+        aria2::KeyVals options;
+        options.push_back({"dir", adi.folderPath});
+
+        aria2::A2Gid gid;
+        int rv = aria2::addUri(g_session, &gid, uris, options);
+        if (rv < 0 || aria2::isNull(gid)) {
+            std::cerr << "Failed to add download: " << adi.url << std::endl;
+            continue;
+        }
+        DownloadInfo info;
+        info.gid = aria2::gidToHex(gid);
+        info.url = adi.url;
+        info.name = displayNameFromUrl(adi.url);
+        info.status = aria2::DOWNLOAD_WAITING;
+        std::lock_guard<std::mutex> lock(g_dlMutex);
+        upsertDownloadLocked(info);
+    }
+}
+
+static void snapshotDownloads() {
+    aria2::GlobalStat gs = aria2::getGlobalStat(g_session);
+    std::vector<aria2::A2Gid> actives = aria2::getActiveDownload(g_session);
+
+    std::unordered_set<std::string> activeSet;
+    for (aria2::A2Gid gid : actives) activeSet.insert(aria2::gidToHex(gid));
+
+    std::lock_guard<std::mutex> lock(g_dlMutex);
+
+    // Make sure every active download has an entry (e.g. ones we did not add ourselves).
+    for (const std::string& gidStr : activeSet) {
+        if (g_downloads.count(gidStr) == 0) {
+            DownloadInfo info;
+            info.gid = gidStr;
+            info.status = aria2::DOWNLOAD_ACTIVE;
+            upsertDownloadLocked(info);
+        }
+    }
+
+    // Refresh every tracked download that is not in a terminal state yet.
+    std::vector<std::string> toDrop;
+    for (const std::string& gidStr : g_order) {
+        auto it = g_downloads.find(gidStr);
+        if (it == g_downloads.end()) continue;
+        DownloadInfo& d = it->second;
+
+        bool terminal = d.status == aria2::DOWNLOAD_COMPLETE ||
+                        d.status == aria2::DOWNLOAD_ERROR ||
+                        d.status == aria2::DOWNLOAD_REMOVED;
+        if (terminal) continue;
+
+        aria2::A2Gid gid = aria2::hexToGid(gidStr);
+        if (aria2::isNull(gid)) { toDrop.push_back(gidStr); continue; }
+
+        if (aria2::DownloadHandle* dh = aria2::getDownloadHandle(g_session, gid)) {
+            fillFromHandle(d, dh);
+            aria2::deleteDownloadHandle(dh);
+            if (d.status == aria2::DOWNLOAD_REMOVED) toDrop.push_back(gidStr);
+        } else {
+            toDrop.push_back(gidStr);
+        }
+    }
+    for (const std::string& gidStr : toDrop) eraseDownloadLocked(gidStr);
+
+    g_gstat = gs;
+}
+
+static void doAria2() {
+    auto lastSnapshot = std::chrono::steady_clock::now() - std::chrono::milliseconds(500);
+
+    while (g_keepRunning) {
+        processPendingCommands();
+        addPendingUris();
+
+        int rv = aria2::run(g_session, aria2::RUN_ONCE);
         if (rv != 1) {
-            // No active downloads running; sleep 20ms to avoid high CPU usage
+            // Nothing active; avoid busy-spinning.
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
 
-        // 3. Snapshot stats every 500ms
         auto now = std::chrono::steady_clock::now();
-        auto count = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
+        if (now - lastSnapshot >= std::chrono::milliseconds(500)) {
+            lastSnapshot = now;
+            snapshotDownloads();
+        }
+    }
 
-        if (count >= 500) {
-            start = now;
-            gstat = aria2::getGlobalStat(session);
-            std::vector<aria2::A2Gid> gids = aria2::getActiveDownload(session);
+    aria2::sessionFinal(g_session);
+    aria2::libraryDeinit();
+}
 
-            std::vector<DownloadInfo> currentDownloads;
-            currentDownloads.reserve(gids.size());
+// ============================================================================
+// Config persistence (~/.config/agui/config)
+// ============================================================================
 
-            for (const auto &gid : gids) {
-                aria2::DownloadHandle *dh = aria2::getDownloadHandle(session, gid);
-                if (dh) {
-                    DownloadInfo info;
-                    info.gid = aria2::gidToHex(gid);
-                    info.dir = dh->getFiles()[0].path;
-                    info.completedLength = dh->getCompletedLength();
-                    info.totalLength = dh->getTotalLength();
-                    info.downloadSpeed = dh->getDownloadSpeed();
-                    info.uploadSpeed = dh->getUploadSpeed();
+static std::filesystem::path configPath() {
+    const char* xdg = getenv("XDG_CONFIG_HOME");
+    if (xdg && *xdg) return std::filesystem::path(xdg) / "agui" / "config";
+    const char* home = getenv("HOME");
+    if (home && *home) return std::filesystem::path(home) / ".config" / "agui" / "config";
+    return "agui.config";
+}
 
-                    currentDownloads.push_back(info);
-                    aria2::deleteDownloadHandle(dh);
+static void loadConfig() {
+    std::ifstream in(configPath());
+    if (!in) return;
+    std::string line;
+    while (std::getline(in, line)) {
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string key = line.substr(0, eq);
+        std::string val = line.substr(eq + 1);
+        if (key == "dir") g_downloadFolder = val;
+    }
+}
+
+static void saveConfig() {
+    std::error_code ec;
+    std::filesystem::path p = configPath();
+    std::filesystem::create_directories(p.parent_path(), ec);
+    std::ofstream out(p, std::ios::trunc);
+    if (out) out << "dir=" << g_downloadFolder << "\n";
+}
+
+// ============================================================================
+// Theme
+// ============================================================================
+
+static ImVec4 Col(int r, int g, int b, int a = 255) {
+    return ImVec4(r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f);
+}
+
+namespace palette {
+    static const ImVec4 bg       = Col(15, 19, 28);    // app background
+    static const ImVec4 surface  = Col(22, 27, 39);    // cards / panels
+    static const ImVec4 surfaceHi= Col(28, 34, 49);    // hover surfaces
+    static const ImVec4 frame    = Col(28, 34, 49);
+    static const ImVec4 frameHov = Col(38, 47, 67);
+    static const ImVec4 frameAct = Col(47, 58, 82);
+    static const ImVec4 text     = Col(233, 237, 243);
+    static const ImVec4 textDim  = Col(140, 150, 168);
+    static const ImVec4 accent   = Col(66, 183, 255);  // cyan-blue
+    static const ImVec4 green    = Col(52, 211, 153);
+    static const ImVec4 orange   = Col(251, 180, 84);
+    static const ImVec4 red      = Col(251, 113, 133);
+    static const ImVec4 sep      = Col(35, 43, 58);
+    static const ImVec4 popup    = Col(20, 26, 38, 250);
+} // namespace palette
+
+static void setupTheme() {
+    ImGuiStyle& s = ImGui::GetStyle();
+
+    s.FrameRounding = 6.0f;
+    s.GrabRounding = 6.0f;
+    s.ChildRounding = 8.0f;
+    s.PopupRounding = 8.0f;
+    s.ScrollbarRounding = 12.0f;
+    s.TabRounding = 6.0f;
+    s.WindowBorderSize = 0.0f;
+    s.ChildBorderSize = 0.0f;
+    s.FrameBorderSize = 0.0f;
+    s.PopupBorderSize = 0.0f;
+    s.FramePadding = ImVec2(10, 7);
+    s.ItemSpacing = ImVec2(10, 9);
+    s.ItemInnerSpacing = ImVec2(7, 5);
+    s.WindowPadding = ImVec2(14, 12);
+    s.ScrollbarSize = 13.0f;
+
+    ImVec4* c = s.Colors;
+    c[ImGuiCol_WindowBg]           = palette::bg;
+    c[ImGuiCol_ChildBg]            = palette::surface;
+    c[ImGuiCol_PopupBg]            = palette::popup;
+    c[ImGuiCol_Border]             = palette::sep;
+    c[ImGuiCol_Text]               = palette::text;
+    c[ImGuiCol_TextDisabled]       = palette::textDim;
+    c[ImGuiCol_FrameBg]            = palette::frame;
+    c[ImGuiCol_FrameBgHovered]     = palette::frameHov;
+    c[ImGuiCol_FrameBgActive]      = palette::frameAct;
+    c[ImGuiCol_TitleBg]            = palette::bg;
+    c[ImGuiCol_TitleBgActive]      = palette::bg;
+    c[ImGuiCol_MenuBarBg]          = palette::surface;
+    c[ImGuiCol_ScrollbarBg]         = Col(0, 0, 0, 0);
+    c[ImGuiCol_ScrollbarGrab]      = Col(40, 50, 70);
+    c[ImGuiCol_ScrollbarGrabHovered] = Col(52, 64, 89);
+    c[ImGuiCol_ScrollbarGrabActive]  = Col(66, 80, 111);
+    c[ImGuiCol_Separator]          = palette::sep;
+    c[ImGuiCol_CheckMark]          = palette::accent;
+    c[ImGuiCol_SliderGrab]         = palette::accent;
+    c[ImGuiCol_SliderGrabActive]   = palette::accent;
+    c[ImGuiCol_Button]             = Col(33, 41, 59);
+    c[ImGuiCol_ButtonHovered]      = Col(44, 54, 77);
+    c[ImGuiCol_ButtonActive]       = Col(54, 66, 94);
+    c[ImGuiCol_Header]             = palette::frame;
+    c[ImGuiCol_HeaderHovered]      = palette::frameHov;
+    c[ImGuiCol_HeaderActive]       = palette::frameAct;
+    c[ImGuiCol_PlotHistogram]      = palette::accent;
+    c[ImGuiCol_PlotHistogramHovered] = Col(120, 205, 255);
+    c[ImGuiCol_TableHeaderBg]      = palette::surface;
+    c[ImGuiCol_TableBorderStrong]  = palette::sep;
+    c[ImGuiCol_TableBorderLight]   = palette::sep;
+    c[ImGuiCol_TextLink]           = palette::accent;
+    c[ImGuiCol_ModalWindowDimBg]   = Col(0, 0, 0, 120);
+}
+
+static void setupFonts(float dpiScale) {
+    ImGuiIO& io = ImGui::GetIO();
+    ImGuiStyle& style = ImGui::GetStyle();
+    style.FontSizeBase = 20.0f * dpiScale;
+
+    // auto tryLoad = [](const char* rel, std::string& out) -> bool {
+    //     std::filesystem::path local(rel);
+    //     if (std::filesystem::exists(local)) { out = local.string(); return true; }
+    //     if (const char* base = SDL_GetBasePath()) {
+    //         std::filesystem::path p = std::filesystem::path(base) / rel;
+    //         SDL_free((void*)base);
+    //         if (std::filesystem::exists(p)) { out = p.string(); return true; }
+    //     }
+    //     return false;
+    // };
+
+    std::string interPath, faPath;
+    // if (tryLoad("InterVariable.ttf", interPath))
+    //     io.Fonts->AddFontFromFileTTF(interPath.c_str(), 0.0f);
+    io.Fonts->AddFontFromMemoryCompressedTTF(u8_compressed_data, u8_compressed_size, 0.0f);
+    static const ImWchar faRange[] = {0xE000, 0xF8FF, 0};
+    ImFontConfig cfg;
+    cfg.MergeMode = true;
+    // if (tryLoad("vendor/fonts/fa-solid-900.ttf", faPath))
+    //     io.Fonts->AddFontFromFileTTF(faPath.c_str(), 0.0f, &cfg, faRange);
+    io.Fonts->AddFontFromMemoryCompressedTTF(FaSolid_compressed_data, FaSolid_compressed_size, 0.0f, &cfg, faRange);
+}
+
+// ============================================================================
+// UI drawing helpers
+// ============================================================================
+
+static ImU32 colU32(const ImVec4& c, float alphaMul = 1.0f) {
+    return ImGui::GetColorU32(ImVec4(c.x, c.y, c.z, c.w * alphaMul));
+}
+
+static void badge(const char* label, const ImVec4& color) {
+    ImGuiStyle& st = ImGui::GetStyle();
+    ImVec2 ts = ImGui::CalcTextSize(label);
+    float padx = 9.0f, pady = 3.0f;
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    float h = ts.y + pady * 2.0f;
+    float w = ts.x + padx * 2.0f;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), colU32(color, 0.22f), h * 0.5f);
+    dl->AddRect(ImVec2(p.x, p.y), ImVec2(p.x + w, p.y + h), colU32(color, 0.55f), h * 0.5f);
+    dl->AddText(ImVec2(p.x + padx, p.y + pady), colU32(color), label);
+    ImGui::Dummy(ImVec2(w + st.ItemSpacing.x * 0.0f, h));
+}
+
+static std::string ellipsize(const std::string& text, float maxW) {
+    if (ImGui::CalcTextSize(text.c_str()).x <= maxW) return text;
+    std::string out = text;
+    while (out.size() > 1 && ImGui::CalcTextSize((out + "...").c_str()).x > maxW)
+        out.pop_back();
+    return out + "...";
+}
+
+struct UiState {
+    char urlBuf[4096] = {0};
+    std::string errorMsg;
+    bool focusUrl = true;
+};
+static UiState g_ui;
+
+static std::vector<std::string> splitTokens(const std::string& text) {
+    std::istringstream iss(text);
+    std::vector<std::string> out;
+    std::string tok;
+    while (iss >> tok) out.push_back(tok);
+    return out;
+}
+
+static void submitUrls() {
+    std::vector<std::string> urls = splitTokens(g_ui.urlBuf);
+    if (urls.empty()) {
+        g_ui.errorMsg = "Enter a URL first.";
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_uriQueueMutex);
+        for (const std::string& u : urls)
+            g_pendingUris.push({u, g_downloadFolder});
+    }
+    g_ui.urlBuf[0] = '\0';
+    g_ui.errorMsg.clear();
+    g_ui.focusUrl = true;
+}
+
+static void drawToolbar() {
+    ImGuiStyle& st = ImGui::GetStyle();
+    float avail = ImGui::GetContentRegionAvail().x;
+
+    float pasteW = ImGui::CalcTextSize(ICON_FA_PASTE).x + st.FramePadding.x * 2.0f;
+    float folderLabel = ImGui::CalcTextSize(ICON_FA_FOLDER_OPEN).x + st.FramePadding.x * 2.0f;
+    float inputW = avail - pasteW - folderLabel - st.ItemSpacing.x * 2.0f;
+
+    if (g_ui.focusUrl) { ImGui::SetKeyboardFocusHere(); g_ui.focusUrl = false; }
+
+    ImGui::SetNextItemWidth(inputW);
+    ImGuiInputTextFlags flags = ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_EscapeClearsAll;
+    if (ImGui::InputTextWithHint("##url", "Paste one or more URLs, separated by spaces...", g_ui.urlBuf, sizeof(g_ui.urlBuf), flags)) {
+        submitUrls();
+    }
+    if (ImGui::IsItemEdited()) g_ui.errorMsg.clear();
+    ImGui::SetItemTooltip("URL to download");
+
+    ImGui::SameLine();
+    if (ImGui::Button(ICON_FA_PASTE)) {
+        if (char* clip = SDL_GetClipboardText()) {
+            std::string text(clip);
+            SDL_free(clip);
+            std::string cur(g_ui.urlBuf);
+            if (cur.empty()) snprintf(g_ui.urlBuf, sizeof(g_ui.urlBuf), "%s", text.c_str());
+            else snprintf(g_ui.urlBuf + strlen(g_ui.urlBuf), sizeof(g_ui.urlBuf) - strlen(g_ui.urlBuf), " %s", text.c_str());
+            g_ui.errorMsg.clear();
+        }
+    }
+    ImGui::SetItemTooltip("Paste from clipboard");
+
+    ImGui::SameLine();
+    if (ImGui::Button(ICON_FA_FOLDER_OPEN)) {
+        const char* startAt = g_downloadFolder.size() > 1 && g_downloadFolder[0] == '/'
+                                  ? g_downloadFolder.c_str()
+                                  : nullptr;
+        SDL_ShowOpenFolderDialog(
+            [](void*, const char* const* filelist, int) {
+                std::lock_guard<std::mutex> lock(g_pickMutex);
+                g_folderPicked = true;
+                g_pickedFolder.clear();
+                if (filelist && filelist[0]) g_pickedFolder = filelist[0];
+            },
+            nullptr, g_window, startAt, false);
+    }
+    ImGui::SetItemTooltip("Choose download folder");
+
+    // Second row: destination + action button.
+    float dlBtnW = ImGui::CalcTextSize(ICON_FA_DOWNLOAD " Download").x + st.FramePadding.x * 2.0f;
+    float destMaxW = ImGui::GetContentRegionAvail().x - dlBtnW - st.ItemSpacing.x;
+
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextColored(palette::textDim, "Saving to:");
+    ImGui::SameLine();
+    std::string shown = ellipsize(g_downloadFolder, destMaxW - ImGui::CalcTextSize("Saving to: ").x);
+    ImGui::TextUnformatted(shown.c_str());
+    ImGui::SetItemTooltip("%s", g_downloadFolder.c_str());
+
+    ImGui::SameLine();
+    float cursorX = ImGui::GetCursorPosX();
+    ImGui::SetCursorPosX(cursorX + ImGui::GetContentRegionAvail().x - dlBtnW);
+    ImGui::PushStyleColor(ImGuiCol_Button, palette::accent);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, Col(96, 200, 255));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, Col(40, 158, 228));
+    ImGui::PushStyleColor(ImGuiCol_Text, Col(10, 16, 24));
+    if (ImGui::Button(ICON_FA_DOWNLOAD " Download"))
+        submitUrls();
+    ImGui::PopStyleColor(4);
+
+    if (!g_ui.errorMsg.empty())
+        ImGui::TextColored(palette::red, "%s", g_ui.errorMsg.c_str());
+}
+
+static void drawStatsBar(const std::vector<DownloadInfo>& list) {
+    ImGuiStyle& st = ImGui::GetStyle();
+    aria2::GlobalStat gs;
+
+    {
+        std::lock_guard<std::mutex> lock(g_dlMutex);
+        gs = g_gstat;
+    }
+
+    int done = 0, errored = 0;
+    for (const auto& d : list) {
+        if (d.status == aria2::DOWNLOAD_COMPLETE) ++done;
+        else if (d.status == aria2::DOWNLOAD_ERROR) ++errored;
+    }
+
+    ImGui::AlignTextToFramePadding();
+    ImGui::PushStyleColor(ImGuiCol_Text, palette::accent);
+    ImGui::TextUnformatted(ICON_FA_ARROW_DOWN);
+    ImGui::PopStyleColor();
+    ImGui::SameLine(0, 2);
+    ImGui::TextUnformatted(fmtSpeed(gs.downloadSpeed).c_str());
+
+    ImGui::SameLine(0, st.ItemSpacing.x * 2);
+    ImGui::PushStyleColor(ImGuiCol_Text, palette::textDim);
+    ImGui::TextUnformatted(ICON_FA_ARROW_UP);
+    ImGui::PopStyleColor();
+    ImGui::SameLine(0, 2);
+    ImGui::TextUnformatted(fmtSpeed(gs.uploadSpeed).c_str());
+
+    ImGui::SameLine(0, st.ItemSpacing.x * 2);
+    ImGui::TextColored(palette::textDim, "|");
+
+    ImGui::SameLine(0, st.ItemSpacing.x * 2);
+    ImGui::Text("%d downloading  %d queued  %d done", gs.numActive, gs.numWaiting, done);
+
+    // Right-aligned: minimize to tray + clear finished.
+    float trashW = ImGui::CalcTextSize(ICON_FA_TRASH).x + st.FramePadding.x * 2.0f;
+    float trayW = ImGui::CalcTextSize(ICON_FA_WINDOW_MINIMIZE).x + st.FramePadding.x * 2.0f;
+    float maxX = ImGui::GetContentRegionAvail().x;
+    ImGui::SameLine();
+    float cur = ImGui::GetCursorPosX();
+
+    bool anyFinished = done + errored > 0;
+    if (!anyFinished) ImGui::BeginDisabled();
+    ImGui::SetCursorPosX(cur + maxX - trashW);
+    ImGui::PushStyleColor(ImGuiCol_Text, palette::red);
+    if (ImGui::Button(ICON_FA_TRASH)) {
+        std::lock_guard<std::mutex> lock(g_dlMutex);
+        std::vector<std::string> doomed;
+        for (const auto& [gid, d] : g_downloads)
+            if (d.status == aria2::DOWNLOAD_COMPLETE || d.status == aria2::DOWNLOAD_ERROR ||
+                d.status == aria2::DOWNLOAD_REMOVED)
+                doomed.push_back(gid);
+        for (const auto& gid : doomed) eraseDownloadLocked(gid);
+    }
+    ImGui::PopStyleColor();
+    ImGui::SetItemTooltip("Clear finished");
+    if (!anyFinished) ImGui::EndDisabled();
+
+    ImGui::SameLine(0, 0);
+    ImGui::SetCursorPosX(cur + maxX - trashW - trayW - st.ItemSpacing.x);
+    if (!g_trayActive.load()) ImGui::BeginDisabled();
+    if (ImGui::Button(ICON_FA_WINDOW_MINIMIZE)) requestHideWindow();
+    ImGui::SetItemTooltip(g_trayActive.load()
+                              ? "Hide to tray (downloads keep running)  \xc2\xb7  Ctrl+H"
+                              : "System tray unavailable");
+    if (!g_trayActive.load()) ImGui::EndDisabled();
+}
+
+static std::string statusLabel(aria2::DownloadStatus status, int errCode, ImVec4* color) {
+    switch (status) {
+    case aria2::DOWNLOAD_ACTIVE:  *color = palette::accent;  return "Downloading";
+    case aria2::DOWNLOAD_WAITING: *color = palette::textDim; return "Queued";
+    case aria2::DOWNLOAD_PAUSED:  *color = palette::orange;  return "Paused";
+    case aria2::DOWNLOAD_COMPLETE:*color = palette::green;   return "Complete";
+    case aria2::DOWNLOAD_ERROR: {
+        *color = palette::red;
+        std::string msg = errorString(errCode);
+        return msg.empty() ? "Failed" : msg;
+    }
+    default:                      *color = palette::textDim; return "Removed";
+    }
+}
+
+static void drawDownloadCard(const DownloadInfo& d) {
+    ImGuiStyle& st = ImGui::GetStyle();
+    float lineH = ImGui::GetTextLineHeight();
+    float barH = 18.0f;
+
+    float padY = 12.0f;
+    float cardH = padY + lineH + st.ItemSpacing.y + barH + st.ItemSpacing.y + lineH + padY + 30;
+
+    ImGui::PushID(d.gid.c_str());
+    ImGui::BeginChild("card", ImVec2(0, cardH), ImGuiChildFlags_AlwaysUseWindowPadding);
+
+    // --- Row 1: name + status badge -------------------------------------
+    ImVec4 statusColor = palette::textDim;
+    std::string statusTxt = statusLabel(d.status, d.errorCode, &statusColor);
+
+    float badgeW = ImGui::CalcTextSize(statusTxt.c_str()).x + 18.0f;
+    float availW = ImGui::GetContentRegionAvail().x;
+    std::string name = ellipsize(d.name, availW - badgeW - st.ItemSpacing.x * 2.0f);
+    ImGui::TextUnformatted(name.c_str());
+    if (d.name != name) ImGui::SetItemTooltip("%s", d.name.c_str());
+    else if (!d.path.empty()) ImGui::SetItemTooltip("%s", d.path.c_str());
+
+    ImGui::SameLine();
+    float curX = ImGui::GetCursorPosX();
+    ImGui::SetCursorPosX(curX + ImGui::GetContentRegionAvail().x - badgeW + st.ItemSpacing.x);
+    badge(statusTxt.c_str(), statusColor);
+
+    // --- Row 2: progress bar --------------------------------------------
+    float frac = d.totalLength > 0 ? (float)((double)d.completedLength / (double)d.totalLength) : 0.0f;
+    frac = std::clamp(frac, 0.0f, 1.0f);
+
+    char pct[16];
+    snprintf(pct, sizeof(pct), "%.1f%%", frac * 100.0f);
+
+    ImVec4 barColor = statusColor;
+    if (d.status == aria2::DOWNLOAD_WAITING || d.status == aria2::DOWNLOAD_REMOVED)
+        barColor = palette::frameHov;
+    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, barColor);
+    ImGui::ProgressBar(frac, ImVec2(-FLT_MIN, barH),
+                       d.totalLength > 0 ? pct : "");
+    ImGui::PopStyleColor();
+
+    // --- Row 3: details --------------------------------------------------
+    std::string details;
+    if (d.totalLength > 0)
+        details = fmtBytes(d.completedLength) + " of " + fmtBytes(d.totalLength);
+    else if (!d.url.empty())
+        details = ellipsize(d.url, ImGui::GetContentRegionAvail().x * 0.5f);
+    if (d.status == aria2::DOWNLOAD_ACTIVE && d.downloadSpeed > 0) {
+        details += (details.empty() ? "" : "  \xc2\xb7  ");
+        details += fmtSpeed(d.downloadSpeed);
+        double remain = (double)(d.totalLength - d.completedLength);
+        if (remain > 0) {
+            details += "  \xc2\xb7  ";
+            details += ICON_FA_CLOCK " ";
+            details += fmtETA(remain / d.downloadSpeed) + " left";
+        }
+    }
+    ImGui::TextColored(palette::textDim, "%s", details.c_str());
+    if (!errorString(d.errorCode).empty()) {
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text, palette::red);
+        ImGui::TextUnformatted(errorString(d.errorCode).c_str());
+        ImGui::PopStyleColor();
+    }
+
+    // --- Right-aligned action buttons ------------------------------------
+    enum class Action { Toggle, Remove, OpenFile, OpenFolder, Retry };
+    struct Btn { const char* icon; const char* tip; Action action; };
+
+    std::vector<Btn> buttons;
+    switch (d.status) {
+    case aria2::DOWNLOAD_ACTIVE:
+    case aria2::DOWNLOAD_WAITING:
+        buttons.push_back({ICON_FA_PAUSE, "Pause", Action::Toggle});
+        buttons.push_back({ICON_FA_XMARK, "Cancel", Action::Remove});
+        break;
+    case aria2::DOWNLOAD_PAUSED:
+        buttons.push_back({ICON_FA_PLAY, "Resume", Action::Toggle});
+        buttons.push_back({ICON_FA_XMARK, "Cancel", Action::Remove});
+        break;
+    case aria2::DOWNLOAD_COMPLETE:
+        if (!d.path.empty())
+            buttons.push_back({ICON_FA_OPEN_EXTERNAL, "Open file", Action::OpenFile});
+        buttons.push_back({ICON_FA_FOLDER, "Open folder", Action::OpenFolder});
+        buttons.push_back({ICON_FA_TRASH, "Remove from list", Action::Remove});
+        break;
+    case aria2::DOWNLOAD_ERROR:
+        if (!d.url.empty())
+            buttons.push_back({ICON_FA_DOWNLOAD, "Retry", Action::Retry});
+        buttons.push_back({ICON_FA_TRASH, "Remove from list", Action::Remove});
+        break;
+    default:
+        break;
+    }
+
+    float totalW = 0.0f;
+    for (size_t i = 0; i < buttons.size(); ++i) {
+        totalW += ImGui::CalcTextSize(buttons[i].icon).x + st.FramePadding.x * 2.0f;
+        if (i + 1 < buttons.size()) totalW += st.ItemSpacing.x;
+    }
+    float startX = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - totalW;
+
+    for (const Btn& b : buttons) {
+        ImGui::SameLine(0, 0);
+        ImGui::SetCursorPosX(startX);
+        startX += ImGui::CalcTextSize(b.icon).x + st.FramePadding.x * 2.0f + st.ItemSpacing.x;
+        bool clicked = ImGui::Button(b.icon);
+        ImGui::SetItemTooltip("%s", b.tip);
+        if (!clicked) continue;
+        switch (b.action) {
+        case Action::Toggle: {
+            CmdType t = (d.status == aria2::DOWNLOAD_PAUSED) ? CmdType::Resume : CmdType::Pause;
+            enqueueCommand(t, d.gid);
+            break;
+        }
+        case Action::Remove:
+            enqueueCommand(CmdType::Remove, d.gid);
+            if (d.status != aria2::DOWNLOAD_ACTIVE && d.status != aria2::DOWNLOAD_WAITING &&
+                d.status != aria2::DOWNLOAD_PAUSED) {
+                std::lock_guard<std::mutex> lock(g_dlMutex);
+                eraseDownloadLocked(d.gid);
+            }
+            break;
+        case Action::OpenFile:
+            openWithXdg(d.path);
+            break;
+        case Action::OpenFolder:
+            openWithXdg(d.path.empty() ? g_downloadFolder : directoryOf(d.path));
+            break;
+        case Action::Retry:
+            {
+                std::lock_guard<std::mutex> lock(g_uriQueueMutex);
+                g_pendingUris.push({d.url, g_downloadFolder});
+            }
+            {
+                std::lock_guard<std::mutex> lock(g_dlMutex);
+                eraseDownloadLocked(d.gid);
+            }
+            break;
+        }
+    }
+
+    ImGui::EndChild();
+    ImGui::PopID();
+}
+
+static void drawEmptyState() {
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    ImGuiStyle& st = ImGui::GetStyle();
+
+    float iconScale = 2.6f;
+    float iconSize = ImGui::CalcTextSize(ICON_FA_DOWNLOAD).y * iconScale;
+    float lineH = ImGui::GetTextLineHeight();
+    float blockH = iconSize + st.ItemSpacing.y + lineH + 4.0f + lineH;
+
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    float centerY = p.y + avail.y * 0.5f;
+    float startY = centerY - blockH * 0.5f;
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    float iconW = ImGui::CalcTextSize(ICON_FA_DOWNLOAD).x * iconScale;
+    dl->AddText(NULL, ImGui::GetStyle().FontSizeBase * iconScale,
+                ImVec2(p.x + (avail.x - iconW) * 0.5f, startY),
+                colU32(palette::accent, 0.30f), ICON_FA_DOWNLOAD);
+
+    const char* msg = "No downloads yet";
+    ImVec2 msz = ImGui::CalcTextSize(msg);
+    dl->AddText(ImVec2(p.x + (avail.x - msz.x) * 0.5f, startY + iconSize + st.ItemSpacing.y),
+                colU32(palette::textDim), msg);
+
+    const char* hint = "Paste a URL above to get started.";
+    ImVec2 hsz = ImGui::CalcTextSize(hint);
+    dl->AddText(ImVec2(p.x + (avail.x - hsz.x) * 0.5f, startY + iconSize + st.ItemSpacing.y + lineH + 4.0f),
+                colU32(palette::textDim, 0.55f), hint);
+
+    ImGui::Dummy(avail);
+}
+
+// ============================================================================
+// Window visibility
+//
+// Hiding never destroys the window or the GL context: the aria2 worker thread
+// is independent of the UI, so downloads keep running while hidden and showing
+// the window again is instant.
+// ============================================================================
+
+static void showWindow() {
+    if (!g_window) return;
+    SDL_ShowWindow(g_window);
+    SDL_RaiseWindow(g_window);
+    g_windowVisible.store(true);
+}
+
+static void hideWindow() {
+    if (!g_window) return;
+    SDL_HideWindow(g_window);
+    g_windowVisible.store(false);
+}
+
+// Apply a show/hide request posted by the tray thread. Runs on the SDL thread.
+static void applyVisibilityRequest() {
+    int req = g_visibilityRequest.exchange(0);
+    if (req > 0 && !g_windowVisible.load()) showWindow();
+    else if (req < 0 && g_windowVisible.load()) hideWindow();
+}
+
+// Closing the window hides it to the tray instead of quitting. Without a tray
+// there would be no way back, so in that case close really means quit.
+static void handleCloseRequest() {
+    if (g_trayActive.load()) {
+//        requestToggleWindow();
+        hideWindow();
+        static bool informed = false;
+        if (!informed) {
+            informed = true;
+            desktopNotify("agui is still running",
+                          "Downloads continue in the background. Use the tray icon to reopen.");
+        }
+    } else {
+        requestQuit();
+    }
+}
+
+static void shutdownImGuiBackends() {
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplSDL3_Shutdown();
+    SDL_GL_DestroyContext(g_gl_context);
+    SDL_DestroyWindow(g_window);
+    g_gl_context = nullptr;
+    g_window = nullptr;
+}
+
+// Drain SDL events without touching the GPU. Used while hidden so the process
+// stays responsive (tray requests, dialog callbacks) at near-zero cost.
+static void pumpEventsWhileHidden() {
+    SDL_Event event;
+    // Block briefly instead of spinning; wakes early on any incoming event.
+    SDL_WaitEventTimeout(nullptr, 100);
+    while (SDL_PollEvent(&event)) {
+        ImGui_ImplSDL3_ProcessEvent(&event);
+        if (event.type == SDL_EVENT_QUIT) requestQuit();
+    }
+}
+
+void main_loop(SDL_Window *window, ImGuiIO& io) {
+        applyVisibilityRequest();
+
+        if (!g_windowVisible.load()) {
+            pumpEventsWhileHidden();
+            return;
+        }
+
+        SDL_Event event;
+        while (SDL_PollEvent(&event)) {
+            ImGui_ImplSDL3_ProcessEvent(&event);
+//            if (event.type == SDL_EVENT_QUIT)
+//                requestQuit();
+            if (event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED &&
+                event.window.windowID == SDL_GetWindowID(window))
+                handleCloseRequest();
+            if (event.type == SDL_EVENT_DROP_TEXT) {
+                const char* text = event.drop.data;
+                if (text && *text) {
+                    std::string cur(g_ui.urlBuf);
+                    if (cur.empty())
+                        snprintf(g_ui.urlBuf, sizeof(g_ui.urlBuf), "%s", text);
+                    else
+                        snprintf(g_ui.urlBuf + strlen(g_ui.urlBuf),
+                                 sizeof(g_ui.urlBuf) - strlen(g_ui.urlBuf), " %s", text);
+                    g_ui.errorMsg.clear();
+                    g_ui.focusUrl = true;
+                }
+            }
+        }
+
+        // Collect async folder-picker results.
+        {
+            std::lock_guard<std::mutex> lock(g_pickMutex);
+            if (g_folderPicked) {
+                g_folderPicked = false;
+                if (!g_pickedFolder.empty() && g_pickedFolder != g_downloadFolder) {
+                    g_downloadFolder = g_pickedFolder;
+                    saveConfig();
+                }
+            }
+        }
+
+        if (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED) {
+            SDL_Delay(10);
+            return;
+        }
+
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplSDL3_NewFrame();
+        ImGui::NewFrame();
+
+        // Shortcuts: Ctrl+H hides to tray, Ctrl+Q quits for real.
+        if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Q)) requestQuit();
+        if (g_trayActive.load() && ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_H))
+            requestHideWindow();
+
+        {
+            ImGui::SetNextWindowPos(ImVec2(0, 0));
+            ImGui::SetNextWindowSize(io.DisplaySize);
+            ImGui::Begin("main", NULL,
+                         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoTitleBar |
+                             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus |
+                             ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+                             ImGuiWindowFlags_NoSavedSettings);
+
+            drawToolbar();
+            ImGui::Separator();
+
+            // Snapshot of shared state for this frame.
+            std::vector<DownloadInfo> list;
+            {
+                std::lock_guard<std::mutex> lock(g_dlMutex);
+                list.reserve(g_order.size());
+                for (const std::string& gid : g_order) {
+                    auto it = g_downloads.find(gid);
+                    if (it != g_downloads.end()) list.push_back(it->second);
                 }
             }
 
-            {
-                std::lock_guard<std::mutex> lock(dhsMutex);
-                dhs = std::move(currentDownloads);
+            drawStatsBar(list);
+            ImGui::Separator();
+
+            float footerH = 0.0f;
+            ImGui::BeginChild("downloads", ImVec2(0, -footerH),
+                              ImGuiChildFlags_None,
+                              ImGuiWindowFlags_NoScrollbar);
+            if (list.empty()) {
+                drawEmptyState();
+            } else {
+                for (const DownloadInfo& d : list)
+                    drawDownloadCard(d);
+            }
+            ImGui::EndChild();
+
+            ImGui::End();
+        }
+
+        ImGui::Render();
+        ImVec4 clear_color = palette::bg;
+        glViewport(0, 0, (int)io.DisplaySize.x, (int)io.DisplaySize.y);
+        glClearColor(clear_color.x * clear_color.w, clear_color.y * clear_color.w,
+                     clear_color.z * clear_color.w, clear_color.w);
+        glClear(GL_COLOR_BUFFER_BIT);
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        SDL_GL_SwapWindow(window);
+}
+
+
+
+// ============================================================================
+// System tray (GTK appindicator)
+//
+// gtk_main() runs on its own thread. Menu callbacks therefore never touch SDL,
+// ImGui or the GL context directly: they only enqueue aria2 commands (already
+// mutex-guarded) or post an atomic visibility request that the SDL thread
+// applies at the top of its frame. The label/icon refresh runs as a GTK timeout
+// so it stays on the GTK thread too.
+// ============================================================================
+
+static GtkWidget* g_trayToggleItem = nullptr;
+static GtkWidget* g_trayStatusItem = nullptr;
+static GtkWidget* g_trayPauseItem = nullptr;
+static GtkWidget* g_trayResumeItem = nullptr;
+static AppIndicator* g_indicator = nullptr;
+
+static void on_tray_quit(GtkMenuItem*, gpointer) {
+    requestQuit();
+}
+
+static void on_tray_toggle(GtkMenuItem*, gpointer) {
+    requestToggleWindow();
+}
+
+static void on_tray_pause_all(GtkMenuItem*, gpointer) {
+    enqueueCommand(CmdType::PauseAll, std::string());
+}
+
+static void on_tray_resume_all(GtkMenuItem*, gpointer) {
+    enqueueCommand(CmdType::ResumeAll, std::string());
+}
+
+static void on_tray_open_folder(GtkMenuItem*, gpointer) {
+    openWithXdg(g_downloadFolder);
+}
+
+// Periodic refresh of the tray menu text and icon (GTK thread).
+static gboolean tray_refresh(gpointer) {
+    if (g_done.load()) {
+        gtk_main_quit();
+        return G_SOURCE_REMOVE;
+    }
+
+    int active = 0, paused = 0, waiting = 0, done = 0, failed = 0;
+    int64_t speed = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_dlMutex);
+        speed = g_gstat.downloadSpeed;
+        for (const auto& [gid, d] : g_downloads) {
+            switch (d.status) {
+            case aria2::DOWNLOAD_ACTIVE:   ++active; break;
+            case aria2::DOWNLOAD_PAUSED:   ++paused; break;
+            case aria2::DOWNLOAD_WAITING:  ++waiting; break;
+            case aria2::DOWNLOAD_COMPLETE: ++done; break;
+            case aria2::DOWNLOAD_ERROR:    ++failed; break;
+            default: break;
             }
         }
     }
 
-    // Clean teardown on application exit
-    aria2::sessionFinal(session);
-    aria2::libraryDeinit();
+    if (g_trayToggleItem)
+        gtk_menu_item_set_label(GTK_MENU_ITEM(g_trayToggleItem),
+                                g_windowVisible.load() ? "Hide window" : "Show window");
+
+    if (g_trayStatusItem) {
+        std::string status;
+        if (active > 0) {
+            status = std::to_string(active) + " downloading \xc2\xb7 " + fmtSpeed(speed);
+            if (waiting > 0) status += " \xc2\xb7 " + std::to_string(waiting) + " queued";
+        } else if (paused > 0) {
+            status = std::to_string(paused) + " paused";
+        } else if (waiting > 0) {
+            status = std::to_string(waiting) + " queued";
+        } else if (failed > 0) {
+            status = std::to_string(failed) + " failed";
+        } else if (done > 0) {
+            status = std::to_string(done) + " completed";
+        } else {
+            status = "Idle";
+        }
+        gtk_menu_item_set_label(GTK_MENU_ITEM(g_trayStatusItem), status.c_str());
+    }
+
+    if (g_trayPauseItem)
+        gtk_widget_set_sensitive(g_trayPauseItem, active + waiting > 0);
+    if (g_trayResumeItem)
+        gtk_widget_set_sensitive(g_trayResumeItem, paused > 0);
+
+    if (g_indicator) {
+        // Distinct icon while transferring so the tray reflects activity.
+        const char* icon = active > 0 ? "folder-download" : "folder-download-symbolic";
+        app_indicator_set_icon_full(g_indicator, icon, "agui");
+
+        std::string tip = active > 0 ? ("agui \xe2\x80\x94 " + fmtSpeed(speed)) : std::string("agui");
+        app_indicator_set_title(g_indicator, tip.c_str());
+    }
+
+    return G_SOURCE_CONTINUE;
 }
 
-static void on_quit(GtkMenuItem*, gpointer) {
-    done = true;
-    gtk_main_quit();
+static bool startSystemTray(int argc, char** argv) {
+    if (!gtk_init_check(&argc, &argv)) {
+        fprintf(stderr, "agui: GTK unavailable, running without a system tray\n");
+        return false;
+    }
+
+    g_indicator = app_indicator_new("agui", "folder-download-symbolic",
+                                    APP_INDICATOR_CATEGORY_APPLICATION_STATUS);
+    if (!g_indicator) {
+        fprintf(stderr, "agui: could not create tray icon\n");
+        return false;
+    }
+    app_indicator_set_status(g_indicator, APP_INDICATOR_STATUS_ACTIVE);
+    app_indicator_set_title(g_indicator, "agui");
+
+    GtkWidget* menu = gtk_menu_new();
+
+    // Non-clickable status line at the top.
+    g_trayStatusItem = gtk_menu_item_new_with_label("Idle");
+    gtk_widget_set_sensitive(g_trayStatusItem, FALSE);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), g_trayStatusItem);
+
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
+
+    g_trayToggleItem = gtk_menu_item_new_with_label("Hide window");
+    g_signal_connect(g_trayToggleItem, "activate", G_CALLBACK(on_tray_toggle), nullptr);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), g_trayToggleItem);
+
+    g_trayPauseItem = gtk_menu_item_new_with_label("Pause all");
+    g_signal_connect(g_trayPauseItem, "activate", G_CALLBACK(on_tray_pause_all), nullptr);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), g_trayPauseItem);
+
+    g_trayResumeItem = gtk_menu_item_new_with_label("Resume all");
+    g_signal_connect(g_trayResumeItem, "activate", G_CALLBACK(on_tray_resume_all), nullptr);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), g_trayResumeItem);
+
+    GtkWidget* folder_item = gtk_menu_item_new_with_label("Open download folder");
+    g_signal_connect(folder_item, "activate", G_CALLBACK(on_tray_open_folder), nullptr);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), folder_item);
+
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
+
+    GtkWidget* quit_item = gtk_menu_item_new_with_label("Quit");
+    g_signal_connect(quit_item, "activate", G_CALLBACK(on_tray_quit), nullptr);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), quit_item);
+
+    gtk_widget_show_all(menu);
+    app_indicator_set_menu(g_indicator, GTK_MENU(menu));
+
+    // Middle-click / primary activation shows the window on hosts that support it.
+    app_indicator_set_secondary_activate_target(g_indicator, g_trayToggleItem);
+
+    g_timeout_add(500, tray_refresh, nullptr);
+
+    std::thread([] { gtk_main(); }).detach();
+    return true;
 }
 
+// ============================================================================
+// main
+// ============================================================================
 
+int main(int argc, char** argv) {
+    bool startHidden = false;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--hidden") == 0 || strcmp(argv[i], "--tray") == 0) {
+            startHidden = true;
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("usage: agui [--hidden]\n"
+                   "  --hidden, --tray   start minimized to the system tray\n");
+            return 0;
+        }
+    }
 
-int main(int argc, char **argv) {
-    int rv = 0;
     aria2::libraryInit();
 
     aria2::SessionConfig config;
     config.downloadEventCallback = downloadEventCallback;
     config.keepRunning = true;
-    session = aria2::sessionNew(aria2::KeyVals(), config);
+    g_session = aria2::sessionNew(aria2::KeyVals(), config);
+
+    loadConfig();
     std::thread aria2Thread(doAria2);
 
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
@@ -233,10 +1397,11 @@ int main(int argc, char **argv) {
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
-    float main_scale = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
+    g_main_scale = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
 
-    SDL_WindowFlags window_flags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN | SDL_WINDOW_HIGH_PIXEL_DENSITY;
-    SDL_Window* window = SDL_CreateWindow("Dear ImGui SDL3+OpenGL3 example", (int)(1280 * main_scale), (int)(800 * main_scale), window_flags);
+    SDL_WindowFlags window_flags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE |
+                                   SDL_WINDOW_HIDDEN | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+    SDL_Window* window = SDL_CreateWindow("agui", (int)(1280 * g_main_scale), (int)(800 * g_main_scale), window_flags);
     if (window == nullptr) {
         printf("Error: SDL_CreateWindow(): %s\n", SDL_GetError());
         return 1;
@@ -249,267 +1414,52 @@ int main(int argc, char **argv) {
 
     SDL_GL_MakeCurrent(window, gl_context);
     SDL_GL_SetSwapInterval(1);
+    SDL_SetWindowMinimumSize(window, 640, 420);
     SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
-    SDL_ShowWindow(window);
+    SDL_SetEventEnabled(SDL_EVENT_DROP_TEXT, true);
 
+    g_window = window;
+    g_gl_context = gl_context;
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
-    ImGuiIO& io = ImGui::GetIO(); (void)io;
+    ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
 
-    ImGui::StyleColorsDark();
-
-    ImGuiStyle& style = ImGui::GetStyle();
-    style.ScaleAllSizes(main_scale);
-    style.FontScaleDpi = main_scale;
+    setupTheme();
 
     ImGui_ImplSDL3_InitForOpenGL(window, gl_context);
     ImGui_ImplOpenGL3_Init(glsl_version);
 
-    style.FontSizeBase = 20.0f;
-    io.Fonts->AddFontFromFileTTF("./InterVariable.ttf");
+    setupFonts(g_main_scale);
 
-    // system tray
-    gtk_init(&argc, &argv);
+    g_trayActive.store(startSystemTray(argc, argv));
 
-    AppIndicator* indicator = app_indicator_new(
-        "myapp",
-        "folder-download-symbolic",
-        APP_INDICATOR_CATEGORY_APPLICATION_STATUS
-    );
-
-    app_indicator_set_status(indicator, APP_INDICATOR_STATUS_ACTIVE);
-
-    GtkWidget* menu = gtk_menu_new();
-
-    GtkWidget* quit_item = gtk_menu_item_new_with_label("Quit");
-    g_signal_connect(quit_item, "activate", G_CALLBACK(on_quit), nullptr);
-    gtk_menu_shell_append(GTK_MENU_SHELL(menu), quit_item);
-
-    gtk_widget_show_all(menu);
-    app_indicator_set_menu(indicator, GTK_MENU(menu));
-
-    std::thread gtkApp(gtk_main);
-    
-
-    bool show_demo_window = false;
-    bool show_my_window = true;
-    ImVec4 clear_color = ImVec4(0.0f, 0.0f, 0.0f, 1.00f);
-
-    while (!done) {
-        SDL_Event event;
-        while (SDL_PollEvent(&event)) {
-            ImGui_ImplSDL3_ProcessEvent(&event);
-            if (event.type == SDL_EVENT_QUIT)
-                done = true;
-            if (event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED && event.window.windowID == SDL_GetWindowID(window))
-                done = true;
-        }
-
-        if (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED) {
-            SDL_Delay(10);
-            continue;
-        }
-
-        ImGui_ImplOpenGL3_NewFrame();
-        ImGui_ImplSDL3_NewFrame();
-        ImGui::NewFrame();
-
-        static char name[256] = {0};
-        static std::string content = "";
-
-        if (show_my_window) {
-            ImGui::Begin("main", NULL, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoTitleBar);
-            ImGui::SetWindowPos({0, 0});
-            int x = 0;
-            int y = 0;
-            SDL_GetWindowSize(window, &x, &y);
-            ImGui::SetWindowSize({(float) x, (float) y});
-            ImGui::Text("Download Settings:");
-            
-            // Show current download folder with change button
-            // {
-            //     ImGui::PushID("folder_display");
-            //     ImGui::TextColored(ImVec4(0.5f, 0.6f, 0.5f, 1.0f), "Download folder: %s", downloadFolder.c_str());
-            //     if (ImGui::Button("Change folder")) {
-            //         std::string folder_path = exec("zenity --file-selection --directory");
-            //         if (!folder_path.empty()) {
-            //             std::string folder_name = folder_path;
-            //             for (int i = folder_path.size() - 1; i >= 0; --i) {
-            //                 if (folder_path[i] == '/' || folder_path[i] == '\\') {
-            //                     folder_name = folder_path.substr(i + 1, folder_path.size() - i - 1);
-            //                     break;
-            //                 }
-            //             }
-            //             downloadFolder = folder_path;
-            //             std::cout << "New folder: " << downloadFolder << std::endl;
-            //         }
-            //     }
-            //     ImGui::PopID();
-            // }
-
-            // URL input field
-            ImGui::InputText("##url", name, sizeof name);
-            ImGui::SetItemTooltip("Enter URL to download");
-
-            if (ImGui::Button("Pick download folder")) {
-                std::string folder_path = exec("zenity --file-selection --directory");
-                if (!folder_path.empty()) {
-                    downloadFolder = folder_path;
-                }
-                std::cout << "Selected folder: " << folder_path << std::endl;
-            }
-
-            if (ImGui::Button("Download")) {
-                if (strlen(name) > 0) {
-                    std::string folder_path = downloadFolder;
-                    
-                    std::cout << "Downloading: " << name << std::endl;
-                    std::lock_guard<std::mutex> lock(uriQueueMutex);
-                    AddDownloadInfo aid = {
-                        .url = name,
-                        .folderPath = downloadFolder
-                    };
-                    pendingUris.push(aid);
-                    name[0] = '\0';
-                } else {
-                    ImGui::TextColored(ImVec4(0.8f, 0.3f, 0.3f, 1.0f), "Please enter a URL first");
-                }
-            }
-
-            {
-                std::lock_guard<std::mutex> lock(dhsMutex);
-                if (dhs.empty()) {
-                    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "No active downloads");
-                    ImGui::TextColored(ImVec4(0.4f, 0.6f, 0.4f, 1.0f), "Download folder: %s", downloadFolder.c_str());
-                } else {
-                    ImGui::Separator();
-                    ImGui::Text("Downloads (%d)", dhs.size());
-                    ImGui::Separator();
-                    ImGui::TextColored(ImVec4(0.4f, 0.6f, 0.4f, 1.0f), "Saving to: %s", downloadFolder.c_str());
-
-                    for (const auto &info : dhs) {
-                        {
-                            ImGui::PushID(info.gid.c_str());
-                            
-                            ImVec4 statusColor;
-                            int speed = info.downloadSpeed / 1024;
-                            if (speed > 100) {
-                                statusColor = ImVec4(0.2f, 0.8f, 0.9f, 1.0f); // Fast - cyan
-                            } else if (speed > 10) {
-                                statusColor = ImVec4(0.3f, 0.7f, 0.5f, 1.0f); // Normal - green
-                            } else {
-                                statusColor = ImVec4(0.8f, 0.5f, 0.3f, 1.0f); // Slow - orange
-                            }
-
-                            const char *file_name = info.dir.c_str();
-
-                            int last_slash = 0;
-                            for (int i = 0; file_name[i] != '\0'; ++i) {
-                                if (file_name[i] == '/') {
-                                    last_slash = i;
-                                }
-                            }
-                            
-                            ImGui::TextColored(statusColor, "%s", (file_name + last_slash + 1));
-                            
-                            float progress = (float)info.completedLength / info.totalLength;
-                            if (info.totalLength > 0) {
-                                ImGui::ProgressBar(progress, ImVec2(-1, 20));
-                            }
-                            
-                            ImGui::PopID();
-                        }
-                        
-
-                        {
-                            ImGui::PushID(info.gid.c_str());
-                            
-                            int speed_kib = info.downloadSpeed / 1024;
-                            char speedStr[32];
-                            if (speed_kib >= 1000) {
-                                snprintf(speedStr, sizeof(speedStr), "%.2f MB/s", speed_kib / 1000.0f);
-                            } else if (speed_kib > 0) {
-                                snprintf(speedStr, sizeof(speedStr), "%d KiB/s", speed_kib);
-                            } else {
-                                snprintf(speedStr, sizeof(speedStr), "0 KiB/s");
-                            }
-                            
-                            char timeStr[32];
-                            if (info.totalLength > info.completedLength) {
-                                double remaining = info.totalLength - info.completedLength;
-                                
-                                if (info.downloadSpeed > 0) {
-                                    double seconds = remaining / info.downloadSpeed;
-                                    int hours = (int)(seconds / 3600);
-                                    int mins = (int)((seconds - (hours * 3600)) / 60);
-                                    int secs = (int)(seconds - (mins * 60));
-                                    snprintf(timeStr, sizeof(timeStr), "Remaining: %02d:%02d:%02d", hours, mins, secs);
-                                } else {
-                                    snprintf(timeStr, sizeof(timeStr), "Paused");
-                                }
-                            } else {
-                                snprintf(timeStr, sizeof(timeStr), "Complete");
-                            }
-                            
-                            // Main info line
-                            ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), 
-                                             "  %s | %s | %s", 
-                                             timeStr,
-                                             speedStr,
-                                             info.dir.c_str());
-                            
-                            ImGui::PopID();
-                        }
-                        
-                        // Progress details
-                        {
-                            ImGui::PushID(info.gid.c_str());
-                            
-                            char percentStr[32];
-                            float percent = (float)info.completedLength / info.totalLength * 100.0f;
-                            snprintf(percentStr, sizeof(percentStr), "%.1f%%", percent);
-                            
-                            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
-                                             "  Progress: %s / %lld bytes", 
-                                             percentStr,
-                                             (long long)info.totalLength);
-                            
-                            ImGui::PopID();
-                        }
-                    }
-                }
-            }
-
-            ImGui::End();
-        }
-
-        if (show_demo_window) {
-            ImGui::ShowDemoWindow(&show_demo_window);
-        }
-
-        ImGui::Render();
-        glViewport(0, 0, (int)io.DisplaySize.x, (int)io.DisplaySize.y);
-        glClearColor(clear_color.x * clear_color.w, clear_color.y * clear_color.w, clear_color.z * clear_color.w, clear_color.w);
-        glClear(GL_COLOR_BUFFER_BIT);
-        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-        SDL_GL_SwapWindow(window);
+    // Starting hidden only makes sense when there is a tray to restore from.
+    if (startHidden && g_trayActive.load()) {
+        g_windowVisible.store(false);
+    } else {
+        if (startHidden)
+            fprintf(stderr, "agui: no tray available, starting with the window shown\n");
+        showWindow();
     }
 
-    ImGui_ImplOpenGL3_Shutdown();
-    ImGui_ImplSDL3_Shutdown();
+    while (!g_done.load()) {
+        main_loop(g_window, io);
+    }
+
+    // Let the tray thread tear itself down before GTK state disappears.
+    if (g_trayActive.load()) {
+        g_idle_add([](gpointer) -> gboolean { gtk_main_quit(); return G_SOURCE_REMOVE; }, nullptr);
+    }
+
+    shutdownImGuiBackends();
     ImGui::DestroyContext();
 
-    SDL_GL_DestroyContext(gl_context);
-    SDL_DestroyWindow(window);
     SDL_Quit();
 
-    // Detach or join background thread on shutdown
-    keepRunning = false;
-    if (aria2Thread.joinable()) {
-        aria2Thread.join();
-    }
+    g_keepRunning = false;
+    if (aria2Thread.joinable()) aria2Thread.join();
 
     return 0;
 }
