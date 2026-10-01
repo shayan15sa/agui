@@ -17,8 +17,7 @@
 #include "../libs/emscripten/emscripten_mainloop_stub.h"
 #endif
 
-#include <gtk-3.0/gtk/gtk.h>
-#include <libappindicator3-0.1/libappindicator/app-indicator.h>
+#include <SDL3/SDL_tray.h>
 
 #include <chrono>
 #include <iostream>
@@ -233,8 +232,8 @@ static float g_main_scale = 0.0f;
 // Window visibility / tray state
 //
 // The window is never destroyed while the app lives: closing it only hides it
-// so downloads keep running in the background. Tray callbacks run on the GTK
-// thread, so they only flip an atomic request that the SDL thread acts on.
+// so downloads keep running in the background. SDL tray callbacks run on the
+// main thread and only flip atomics / enqueue commands.
 // ---------------------------------------------------------------------------
 
 static std::atomic<bool> g_done{false};          // real quit requested
@@ -247,6 +246,8 @@ static void requestToggleWindow() {
     g_visibilityRequest.store(g_windowVisible.load() ? -1 : 1);
 }
 static void requestQuit() { g_done.store(true); }
+
+static void updateTray();
 
 static void upsertDownloadLocked(const DownloadInfo& info) {
     if (g_downloads.count(info.gid) == 0) g_order.push_back(info.gid);
@@ -1070,10 +1071,12 @@ static void pumpEventsWhileHidden() {
         ImGui_ImplSDL3_ProcessEvent(&event);
         if (event.type == SDL_EVENT_QUIT) requestQuit();
     }
+    updateTray();
 }
 
 void main_loop(SDL_Window *window, ImGuiIO& io) {
         applyVisibilityRequest();
+        updateTray();
 
         if (!g_windowVisible.load()) {
             pumpEventsWhileHidden();
@@ -1183,47 +1186,86 @@ void main_loop(SDL_Window *window, ImGuiIO& io) {
 
 
 // ============================================================================
-// System tray (GTK appindicator)
-//
-// gtk_main() runs on its own thread. Menu callbacks therefore never touch SDL,
-// ImGui or the GL context directly: they only enqueue aria2 commands (already
-// mutex-guarded) or post an atomic visibility request that the SDL thread
-// applies at the top of its frame. The label/icon refresh runs as a GTK timeout
-// so it stays on the GTK thread too.
+// System tray (SDL3)
 // ============================================================================
 
-static GtkWidget* g_trayToggleItem = nullptr;
-static GtkWidget* g_trayStatusItem = nullptr;
-static GtkWidget* g_trayPauseItem = nullptr;
-static GtkWidget* g_trayResumeItem = nullptr;
-static AppIndicator* g_indicator = nullptr;
+enum class TrayAction { Toggle, PauseAll, ResumeAll, OpenFolder, Quit };
 
-static void on_tray_quit(GtkMenuItem*, gpointer) {
-    requestQuit();
-}
+static SDL_Tray* g_tray = nullptr;
+static SDL_TrayEntry* g_trayToggleItem = nullptr;
+static SDL_TrayEntry* g_trayStatusItem = nullptr;
+static SDL_TrayEntry* g_trayPauseItem = nullptr;
+static SDL_TrayEntry* g_trayResumeItem = nullptr;
+static SDL_Surface* g_trayIconIdle = nullptr;
+static SDL_Surface* g_trayIconActive = nullptr;
+static std::chrono::steady_clock::time_point g_trayLastRefresh{};
+static bool g_trayTransferring = false;
 
-static void on_tray_toggle(GtkMenuItem*, gpointer) {
-    requestToggleWindow();
-}
+static SDL_Surface* makeTrayIcon(bool active) {
+    const int size = 64;
+    SDL_Surface* surf = SDL_CreateSurface(size, size, SDL_PIXELFORMAT_RGBA32);
+    if (!surf) return nullptr;
 
-static void on_tray_pause_all(GtkMenuItem*, gpointer) {
-    enqueueCommand(CmdType::PauseAll, std::string());
-}
+    const uint8_t bgR = active ? 66 : 90;
+    const uint8_t bgG = active ? 183 : 130;
+    const uint8_t bgB = active ? 255 : 170;
+    const int radius = size / 2 - 4;
 
-static void on_tray_resume_all(GtkMenuItem*, gpointer) {
-    enqueueCommand(CmdType::ResumeAll, std::string());
-}
-
-static void on_tray_open_folder(GtkMenuItem*, gpointer) {
-    openWithXdg(g_downloadFolder);
-}
-
-// Periodic refresh of the tray menu text and icon (GTK thread).
-static gboolean tray_refresh(gpointer) {
-    if (g_done.load()) {
-        gtk_main_quit();
-        return G_SOURCE_REMOVE;
+    SDL_LockSurface(surf);
+    uint8_t* pixels = static_cast<uint8_t*>(surf->pixels);
+    const int pitch = surf->pitch;
+    for (int y = 0; y < size; ++y) {
+        for (int x = 0; x < size; ++x) {
+            uint8_t* px = pixels + y * pitch + x * 4;
+            const int cx = x - size / 2;
+            const int cy = y - size / 2;
+            if (cx * cx + cy * cy <= radius * radius) {
+                px[0] = bgR;
+                px[1] = bgG;
+                px[2] = bgB;
+                px[3] = 255;
+            } else {
+                px[0] = px[1] = px[2] = px[3] = 0;
+            }
+        }
     }
+
+    // Simple downward arrow in the center.
+    for (int y = 18; y < 46; ++y) {
+        for (int x = 22; x < 42; ++x) {
+            const int stem = (x >= 29 && x <= 34) ? 1 : 0;
+            const int tip = (y >= 36 && x >= 26 && x <= 37 &&
+                             std::abs(x - 31) <= (y - 36) / 2)
+                                ? 1
+                                : 0;
+            if (!stem && !tip) continue;
+            uint8_t* px = pixels + y * pitch + x * 4;
+            px[0] = px[1] = px[2] = 245;
+            px[3] = 255;
+        }
+    }
+    SDL_UnlockSurface(surf);
+    return surf;
+}
+
+static void SDLCALL onTrayEntry(void* userdata, SDL_TrayEntry* /*entry*/) {
+    switch (static_cast<TrayAction>(reinterpret_cast<uintptr_t>(userdata))) {
+    case TrayAction::Toggle:     requestToggleWindow(); break;
+    case TrayAction::PauseAll:   enqueueCommand(CmdType::PauseAll, std::string()); break;
+    case TrayAction::ResumeAll:  enqueueCommand(CmdType::ResumeAll, std::string()); break;
+    case TrayAction::OpenFolder: openWithXdg(g_downloadFolder); break;
+    case TrayAction::Quit:       requestQuit(); break;
+    }
+}
+
+static void updateTray() {
+    if (!g_tray) return;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (g_trayLastRefresh != std::chrono::steady_clock::time_point{} &&
+        now - g_trayLastRefresh < std::chrono::milliseconds(500))
+        return;
+    g_trayLastRefresh = now;
 
     int active = 0, paused = 0, waiting = 0, done = 0, failed = 0;
     int64_t speed = 0;
@@ -1243,8 +1285,8 @@ static gboolean tray_refresh(gpointer) {
     }
 
     if (g_trayToggleItem)
-        gtk_menu_item_set_label(GTK_MENU_ITEM(g_trayToggleItem),
-                                g_windowVisible.load() ? "Hide window" : "Show window");
+        SDL_SetTrayEntryLabel(g_trayToggleItem,
+                              g_windowVisible.load() ? "Hide window" : "Show window");
 
     if (g_trayStatusItem) {
         std::string status;
@@ -1262,81 +1304,91 @@ static gboolean tray_refresh(gpointer) {
         } else {
             status = "Idle";
         }
-        gtk_menu_item_set_label(GTK_MENU_ITEM(g_trayStatusItem), status.c_str());
+        SDL_SetTrayEntryLabel(g_trayStatusItem, status.c_str());
     }
 
     if (g_trayPauseItem)
-        gtk_widget_set_sensitive(g_trayPauseItem, active + waiting > 0);
+        SDL_SetTrayEntryEnabled(g_trayPauseItem, active + waiting > 0);
     if (g_trayResumeItem)
-        gtk_widget_set_sensitive(g_trayResumeItem, paused > 0);
+        SDL_SetTrayEntryEnabled(g_trayResumeItem, paused > 0);
 
-    if (g_indicator) {
-        // Distinct icon while transferring so the tray reflects activity.
-        const char* icon = active > 0 ? "folder-download" : "folder-download-symbolic";
-        app_indicator_set_icon_full(g_indicator, icon, "agui");
-
-        std::string tip = active > 0 ? ("agui \xe2\x80\x94 " + fmtSpeed(speed)) : std::string("agui");
-        app_indicator_set_title(g_indicator, tip.c_str());
+    const bool transferring = active > 0;
+    if (transferring != g_trayTransferring) {
+        g_trayTransferring = transferring;
+        SDL_SetTrayIcon(g_tray, transferring ? g_trayIconActive : g_trayIconIdle);
     }
 
-    return G_SOURCE_CONTINUE;
+    const std::string tip = transferring ? ("agui \xe2\x80\x94 " + fmtSpeed(speed)) : "agui";
+    SDL_SetTrayTooltip(g_tray, tip.c_str());
 }
 
-static bool startSystemTray(int argc, char** argv) {
-    if (!gtk_init_check(&argc, &argv)) {
-        fprintf(stderr, "agui: GTK unavailable, running without a system tray\n");
+static void destroySystemTray() {
+    if (!g_tray) return;
+    SDL_DestroyTray(g_tray);
+    g_tray = nullptr;
+    g_trayToggleItem = nullptr;
+    g_trayStatusItem = nullptr;
+    g_trayPauseItem = nullptr;
+    g_trayResumeItem = nullptr;
+    if (g_trayIconIdle) {
+        SDL_DestroySurface(g_trayIconIdle);
+        g_trayIconIdle = nullptr;
+    }
+    if (g_trayIconActive) {
+        SDL_DestroySurface(g_trayIconActive);
+        g_trayIconActive = nullptr;
+    }
+}
+
+static bool startSystemTray() {
+    g_trayIconIdle = makeTrayIcon(false);
+    g_trayIconActive = makeTrayIcon(true);
+
+    g_tray = SDL_CreateTray(g_trayIconIdle, "agui");
+    if (!g_tray) {
+        fprintf(stderr, "agui: could not create system tray: %s\n", SDL_GetError());
+        destroySystemTray();
         return false;
     }
 
-    g_indicator = app_indicator_new("agui", "folder-download-symbolic",
-                                    APP_INDICATOR_CATEGORY_APPLICATION_STATUS);
-    if (!g_indicator) {
-        fprintf(stderr, "agui: could not create tray icon\n");
+    SDL_TrayMenu* menu = SDL_CreateTrayMenu(g_tray);
+    if (!menu) {
+        fprintf(stderr, "agui: could not create tray menu: %s\n", SDL_GetError());
+        destroySystemTray();
         return false;
     }
-    app_indicator_set_status(g_indicator, APP_INDICATOR_STATUS_ACTIVE);
-    app_indicator_set_title(g_indicator, "agui");
 
-    GtkWidget* menu = gtk_menu_new();
+    g_trayStatusItem = SDL_InsertTrayEntryAt(
+        menu, -1, "Idle", SDL_TRAYENTRY_BUTTON | SDL_TRAYENTRY_DISABLED);
+    SDL_InsertTrayEntryAt(menu, -1, nullptr, 0);
 
-    // Non-clickable status line at the top.
-    g_trayStatusItem = gtk_menu_item_new_with_label("Idle");
-    gtk_widget_set_sensitive(g_trayStatusItem, FALSE);
-    gtk_menu_shell_append(GTK_MENU_SHELL(menu), g_trayStatusItem);
+    g_trayToggleItem = SDL_InsertTrayEntryAt(menu, -1, "Hide window", SDL_TRAYENTRY_BUTTON);
+    SDL_SetTrayEntryCallback(g_trayToggleItem, onTrayEntry,
+                             reinterpret_cast<void*>(static_cast<uintptr_t>(TrayAction::Toggle)));
 
-    gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
+    g_trayPauseItem = SDL_InsertTrayEntryAt(menu, -1, "Pause all", SDL_TRAYENTRY_BUTTON);
+    SDL_SetTrayEntryCallback(g_trayPauseItem, onTrayEntry,
+                             reinterpret_cast<void*>(static_cast<uintptr_t>(TrayAction::PauseAll)));
 
-    g_trayToggleItem = gtk_menu_item_new_with_label("Hide window");
-    g_signal_connect(g_trayToggleItem, "activate", G_CALLBACK(on_tray_toggle), nullptr);
-    gtk_menu_shell_append(GTK_MENU_SHELL(menu), g_trayToggleItem);
+    g_trayResumeItem = SDL_InsertTrayEntryAt(menu, -1, "Resume all", SDL_TRAYENTRY_BUTTON);
+    SDL_SetTrayEntryCallback(g_trayResumeItem, onTrayEntry,
+                             reinterpret_cast<void*>(static_cast<uintptr_t>(TrayAction::ResumeAll)));
 
-    g_trayPauseItem = gtk_menu_item_new_with_label("Pause all");
-    g_signal_connect(g_trayPauseItem, "activate", G_CALLBACK(on_tray_pause_all), nullptr);
-    gtk_menu_shell_append(GTK_MENU_SHELL(menu), g_trayPauseItem);
+    SDL_TrayEntry* folderItem =
+        SDL_InsertTrayEntryAt(menu, -1, "Open download folder", SDL_TRAYENTRY_BUTTON);
+    SDL_SetTrayEntryCallback(folderItem, onTrayEntry,
+                             reinterpret_cast<void*>(static_cast<uintptr_t>(TrayAction::OpenFolder)));
 
-    g_trayResumeItem = gtk_menu_item_new_with_label("Resume all");
-    g_signal_connect(g_trayResumeItem, "activate", G_CALLBACK(on_tray_resume_all), nullptr);
-    gtk_menu_shell_append(GTK_MENU_SHELL(menu), g_trayResumeItem);
+    SDL_InsertTrayEntryAt(menu, -1, nullptr, 0);
 
-    GtkWidget* folder_item = gtk_menu_item_new_with_label("Open download folder");
-    g_signal_connect(folder_item, "activate", G_CALLBACK(on_tray_open_folder), nullptr);
-    gtk_menu_shell_append(GTK_MENU_SHELL(menu), folder_item);
+    SDL_TrayEntry* quitItem = SDL_InsertTrayEntryAt(menu, -1, "Quit", SDL_TRAYENTRY_BUTTON);
+    SDL_SetTrayEntryCallback(quitItem, onTrayEntry,
+                             reinterpret_cast<void*>(static_cast<uintptr_t>(TrayAction::Quit)));
 
-    gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
-
-    GtkWidget* quit_item = gtk_menu_item_new_with_label("Quit");
-    g_signal_connect(quit_item, "activate", G_CALLBACK(on_tray_quit), nullptr);
-    gtk_menu_shell_append(GTK_MENU_SHELL(menu), quit_item);
-
-    gtk_widget_show_all(menu);
-    app_indicator_set_menu(g_indicator, GTK_MENU(menu));
-
-    // Middle-click / primary activation shows the window on hosts that support it.
-    app_indicator_set_secondary_activate_target(g_indicator, g_trayToggleItem);
-
-    g_timeout_add(500, tray_refresh, nullptr);
-
-    std::thread([] { gtk_main(); }).detach();
+    SDL_SetTrayEntryEnabled(g_trayPauseItem, false);
+    SDL_SetTrayEntryEnabled(g_trayResumeItem, false);
+    g_trayLastRefresh = {};
+    updateTray();
     return true;
 }
 
@@ -1433,7 +1485,7 @@ int main(int argc, char** argv) {
 
     setupFonts(g_main_scale);
 
-    g_trayActive.store(startSystemTray(argc, argv));
+    g_trayActive.store(startSystemTray());
 
     // Starting hidden only makes sense when there is a tray to restore from.
     if (startHidden && g_trayActive.load()) {
@@ -1448,10 +1500,7 @@ int main(int argc, char** argv) {
         main_loop(g_window, io);
     }
 
-    // Let the tray thread tear itself down before GTK state disappears.
-    if (g_trayActive.load()) {
-        g_idle_add([](gpointer) -> gboolean { gtk_main_quit(); return G_SOURCE_REMOVE; }, nullptr);
-    }
+    destroySystemTray();
 
     shutdownImGuiBackends();
     ImGui::DestroyContext();

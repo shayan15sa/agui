@@ -25,6 +25,6 @@ It uses libaria2 and ImGui (SDL3 + OpenGL3).
 cmake -B build && cmake --build build   # equivalent CMake path
 ```
 
-Requires: clang++, pkg-config, libaria2, SDL3 (>=3.2 for native dialogs),
-GTK3 + libappindicator (system tray), OpenGL. The Inter UI font and the
-FontAwesome icon font are loaded from the repo (`vendor/fonts/`).
+Requires: clang++, pkg-config, libaria2, SDL3 (>=3.2 for native dialogs and
+system tray), OpenGL. The Inter UI font and the FontAwesome icon font are loaded
+from the repo (`vendor/fonts/`).

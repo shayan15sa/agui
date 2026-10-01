@@ -34,7 +34,7 @@ static bool append_pkgconfig_flags(Nob_Cmd *cmd, const char *flag)
 {
     Nob_String_Builder sb = {0};
     char query[512];
-    snprintf(query, sizeof(query), "pkg-config %s appindicator3-0.1 gtk+-3.0", flag);
+    snprintf(query, sizeof(query), "pkg-config %s sdl3", flag);
 
     FILE *pipe = popen(query, "r");
     if (!pipe) {
@@ -48,7 +48,7 @@ static bool append_pkgconfig_flags(Nob_Cmd *cmd, const char *flag)
     int ok = pclose(pipe) == 0;
     if (!ok || !sb.items) {
         nob_sb_free(sb);
-        nob_log(NOB_ERROR, "pkg-config could not find appindicator3-0.1/gtk+-3.0");
+        nob_log(NOB_ERROR, "pkg-config could not find sdl3");
         return false;
     }
 
