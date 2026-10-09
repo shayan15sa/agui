@@ -12,20 +12,29 @@ It uses libaria2 and ImGui (SDL3 + OpenGL3).
 - Completed and failed downloads stay in the list with status badges and error
   descriptions; clear them all with the trash button.
 - Global stats bar: aggregate download/upload speed and item counts.
-- Desktop notifications on completion/failure (notify-send).
+- Desktop notifications on completion/failure (native backend per OS).
 - Download folder picker uses native SDL dialogs; the choice is persisted in
-  `~/.config/agui/config`.
+  the per-platform config location (`SDL_GetPrefPath`, migrated from
+  `~/.config/agui/config` when present).
 
 ## Building
 
 ```
 git clone --recursive https://github.com/shayan15sa/agui.git
+
+# Linux:
 ./nob            # debug build with ASan+UBSan into build/agui
 ./nob release    # optimized build
 ./nob -B         # force full rebuild
 
-cmake -B build && cmake --build build   # equivalent CMake path
+# macOS / Windows (and Linux too):
+cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
 ```
+
+`./nob` is a Linux-only shortcut; other platforms use the CMake path above
+(Windows via MSYS2 UCRT64, macOS via Homebrew). `./build/agui --self-test`
+runs headless platform checks (config path, open/notify backends, process
+launch).
 
 Requires: clang++, pkg-config, libaria2, SDL3 (>=3.2 for native dialogs and
 system tray), OpenGL. The Inter UI font and the FontAwesome icon font are loaded

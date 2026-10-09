@@ -58,6 +58,11 @@ target_link_libraries(agui PRIVATE
     ${CMAKE_DL_LIBS}
 )
 
+if(WIN32)
+    # ShellExecuteW / tray-icon balloons.
+    target_link_libraries(agui PRIVATE shell32)
+endif()
+
 # Usage (equivalent to nob.c):
 #   cmake -B build
 #   cmake --build build

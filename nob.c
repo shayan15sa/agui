@@ -1,6 +1,12 @@
 #define NOB_IMPLEMENTATION
 #include "nob.h"
 
+// nob is the Linux dev-workflow shortcut (clang++, pkg-config, -ldl).
+// On macOS/Windows use the CMake build instead (see README).
+#if !defined(__linux__)
+#error "nob.c is Linux-only; use the CMake build on other platforms"
+#endif
+
 #include <string.h>
 #include <ctype.h>
 
