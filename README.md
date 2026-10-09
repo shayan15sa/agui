@@ -1,4 +1,5 @@
 # agui: A GUI for aria2
+[![build](https://github.com/shayan15sa/agui/actions/workflows/build.yml/badge.svg)](https://github.com/shayan15sa/agui/actions/workflows/build.yml)
 I couldn't find anything simple enough for this need so I decided to make my own.
 It uses libaria2 and ImGui (SDL3 + OpenGL3).
 
@@ -18,6 +19,7 @@ It uses libaria2 and ImGui (SDL3 + OpenGL3).
 ## Building
 
 ```
+git clone --recursive https://github.com/shayan15sa/agui.git
 ./nob            # debug build with ASan+UBSan into build/agui
 ./nob release    # optimized build
 ./nob -B         # force full rebuild

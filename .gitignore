@@ -1,5 +1,7 @@
 build/
-vendor/
+vendor/*
+!vendor/imgui
+!vendor/fonts
 nob
 nob.old
 imgui.ini

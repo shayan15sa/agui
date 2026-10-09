@@ -11,12 +11,19 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type (Debug or Release)" FORCE)
 endif()
 
-add_compile_options(-Wall -Wextra)
+if(MSVC)
+    add_compile_options(/W4)
+else()
+    add_compile_options(-Wall -Wextra)
+endif()
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    add_compile_options(-g -O1 -fno-omit-frame-pointer)
-    add_compile_options(-fsanitize=address,undefined)
-    add_link_options(-fsanitize=address,undefined)
+    # Sanitizers only where supported (GCC/Clang on non-Windows hosts).
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT WIN32)
+        add_compile_options(-g -O1 -fno-omit-frame-pointer)
+        add_compile_options(-fsanitize=address,undefined)
+        add_link_options(-fsanitize=address,undefined)
+    endif()
 endif()
 
 set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/imgui")

@@ -1,0 +1,210 @@
+# CI/CD: builds agui in Release mode on Linux, macOS and Windows.
+#
+# - Linux (ubuntu-latest): libaria2 from apt, SDL3 built from a pinned source
+#   release (Ubuntu 24.04 has no SDL3 package).
+# - macOS (macos-latest): SDL3 from Homebrew, libaria2 built from a pinned
+#   source release (the Homebrew aria2 bottle ships no libaria2).
+# - Windows (windows-latest): MSYS2 UCRT64, SDL3 + libaria2 from pacman.
+#
+# Pushing a tag like `v1.0.0` additionally publishes a GitHub release with
+# one archive per OS (see the `release` job).
+
+name: build
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SDL_VERSION: 3.4.18
+  SDL_SHA256: 9c75cf16330322c217dedd2e0609f1124f1b54b8633e763467b4684d0f4334a3
+  ARIA2_VERSION: 1.37.0
+  ARIA2_SHA256: 60a420ad7085eb616cb6e2bdf0a7206d68ff3d37fb5a956dc44242eb2f79b66b
+
+jobs:
+  build-linux:
+    name: build (linux-x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake ninja-build pkg-config \
+            libaria2-0-dev libgl1-mesa-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev \
+            libxi-dev libxss-dev libxkbcommon-dev libwayland-dev \
+            libpipewire-0.3-dev libpulse-dev libasound2-dev \
+            libdbus-1-dev libudev-dev libibus-1.0-dev
+
+      - name: Build and install SDL3
+        run: |
+          cd /tmp
+          curl -fsSLO "https://github.com/libsdl-org/SDL/releases/download/release-${SDL_VERSION}/SDL3-${SDL_VERSION}.tar.gz"
+          echo "${SDL_SHA256}  SDL3-${SDL_VERSION}.tar.gz" | sha256sum -c -
+          tar -xzf "SDL3-${SDL_VERSION}.tar.gz"
+          cmake -S "SDL3-${SDL_VERSION}" -B SDL3-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSDL_TESTS=OFF
+          cmake --build SDL3-build
+          sudo cmake --install SDL3-build
+          sudo ldconfig
+          pkg-config --modversion sdl3
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Smoke test
+        run: ./build/agui --help
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp build/agui dist/
+          tar -czf agui-linux-x86_64.tar.gz -C dist agui
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: agui-linux-x86_64
+          path: agui-linux-x86_64.tar.gz
+
+  build-macos:
+    name: build (macos-arm64)
+    runs-on: macos-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          brew install cmake ninja pkg-config sdl3 \
+            openssl@3 c-ares libssh2 sqlite gettext libxml2
+          pkg-config --modversion sdl3
+
+      - name: Build and install libaria2
+        run: |
+          cd /tmp
+          curl -fsSLO "https://github.com/aria2/aria2/releases/download/release-${ARIA2_VERSION}/aria2-${ARIA2_VERSION}.tar.xz"
+          echo "${ARIA2_SHA256}  aria2-${ARIA2_VERSION}.tar.xz" | sha256sum -c -
+          tar -xJf "aria2-${ARIA2_VERSION}.tar.xz"
+          cd "aria2-${ARIA2_VERSION}"
+          OPENSSL_PREFIX="$(brew --prefix openssl@3)"
+          GETTEXT_PREFIX="$(brew --prefix gettext)"
+          LIBXML2_PREFIX="$(brew --prefix libxml2)"
+          export PKG_CONFIG_PATH="${OPENSSL_PREFIX}/lib/pkgconfig:${GETTEXT_PREFIX}/lib/pkgconfig:${LIBXML2_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH}"
+          export CPPFLAGS="-I${OPENSSL_PREFIX}/include -I${GETTEXT_PREFIX}/include -I${LIBXML2_PREFIX}/include"
+          export LDFLAGS="-L${OPENSSL_PREFIX}/lib -L${GETTEXT_PREFIX}/lib -L${LIBXML2_PREFIX}/lib"
+          ./configure --enable-libaria2 --without-gnutls --with-openssl
+          make -j"$(sysctl -n hw.ncpu)"
+          sudo make install
+          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH}" >> "$GITHUB_ENV"
+          pkg-config --modversion libaria2
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Smoke test
+        run: ./build/agui --help
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp build/agui dist/
+          tar -czf agui-macos-arm64.tar.gz -C dist agui
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: agui-macos-arm64
+          path: agui-macos-arm64.tar.gz
+
+  build-windows:
+    name: build (windows-x86_64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            zip
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkg-config
+            mingw-w64-ucrt-x86_64-sdl3
+            mingw-w64-ucrt-x86_64-aria2
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Smoke test
+        run: ./build/agui.exe --help
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp build/agui.exe dist/
+          ldd build/agui.exe | grep -oE '/ucrt64/bin/[^ ]+\.dll' | sort -u | while read -r dll; do cp "$dll" dist/; done
+          (cd dist && zip -r "../agui-windows-x86_64.zip" .)
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: agui-windows-x86_64
+          path: agui-windows-x86_64.zip
+
+  release:
+    name: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-linux, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*/*
+          generate_release_notes: true
