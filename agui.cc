@@ -300,7 +300,7 @@ static void win32NotifyBalloon(const std::string& title, const std::string& msg)
         std::lock_guard<std::mutex> lock(g_notifyMutex);
         nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         nid.uCallbackMessage = WM_APP + 101;
-        nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+        nid.hIcon = LoadIconW(nullptr, (LPCWSTR)(ULONG_PTR)IDI_APPLICATION);
         wcsncpy(nid.szTip, L"agui", ARRAYSIZE(nid.szTip));
         Shell_NotifyIconW(NIM_ADD, &nid);
         nid.uFlags = NIF_INFO;
@@ -1615,6 +1615,7 @@ static bool runSelfTest() {
     ok &= checkSelfTest("sep-forward", baseNameOf("C:/Users/x/file.txt"), "file.txt");
     printf("[self-test] open=ShellExecuteW\n");
     printf("[self-test] notify=tray-balloon\n");
+    launchDetached({"cmd.exe", "/c", "exit", "0"}); // exercise the async spawn path
     int rc = runDetached({"cmd.exe", "/c", "exit", "0"});
 #else
 #ifdef __APPLE__
