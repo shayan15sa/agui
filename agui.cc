@@ -19,6 +19,26 @@
 
 #include <SDL3/SDL_tray.h>
 
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <shellapi.h>
+#else
+#include <cerrno>
+#include <unistd.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#if defined(__APPLE__)
+#include <crt_externs.h>
+#endif
+#endif
+
 #include <chrono>
 #include <iostream>
 #include <fstream>
@@ -70,8 +90,15 @@
 // Small string/format helpers
 // ============================================================================
 
+// Path separators: '/' everywhere, plus '\' on Windows.
+#ifdef _WIN32
+static constexpr const char* kPathSeparators = "/\\";
+#else
+static constexpr const char* kPathSeparators = "/";
+#endif
+
 static std::string baseNameOf(const std::string& path) {
-    size_t pos = path.find_last_of('/');
+    size_t pos = path.find_last_of(kPathSeparators);
     if (pos == std::string::npos) return path;
     return path.substr(pos + 1);
 }
@@ -90,9 +117,9 @@ static std::string displayNameFromUrl(const std::string& url) {
 }
 
 static std::string directoryOf(const std::string& path) {
-    size_t pos = path.find_last_of('/');
+    size_t pos = path.find_last_of(kPathSeparators);
     if (pos == std::string::npos) return ".";
-    if (pos == 0) return "/";
+    if (pos == 0) return path.substr(0, 1);
     return path.substr(0, pos);
 }
 
@@ -133,14 +160,89 @@ static std::string fmtETA(double seconds) {
     return buf;
 }
 
-static std::string shellQuote(const std::string& s) {
-    std::string r = "'";
-    for (char ch : s) {
-        if (ch == '\'') r += "'\\''";
-        else r += ch;
+
+#ifdef _WIN32
+static std::wstring win32Widen(const std::string& s) {
+    if (s.empty()) return std::wstring();
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+    if (n <= 0) return std::wstring();
+    std::wstring w((size_t)n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), n);
+    w.resize((size_t)(n - 1));
+    return w;
+}
+
+// Quote one argv element following CommandLineToArgvW rules.
+static void win32AppendArg(std::wstring& cmd, const std::string& arg) {
+    std::wstring w = win32Widen(arg);
+    if (!w.empty() && w.find_first_of(L" \t\n\v\"") == std::wstring::npos) {
+        cmd += w;
+        return;
     }
-    r += "'";
-    return r;
+    cmd += L'"';
+    size_t backslashes = 0;
+    for (wchar_t ch : w) {
+        if (ch == L'\\') {
+            ++backslashes;
+            continue;
+        }
+        if (ch == L'"') cmd.append(backslashes * 2 + 1, L'\\');
+        else if (backslashes > 0) { cmd.append(backslashes, L'\\'); backslashes = 0; }
+        cmd += ch;
+    }
+    if (backslashes > 0) cmd.append(backslashes * 2, L'\\');
+    cmd += L'"';
+}
+#else
+#if defined(__APPLE__)
+static char** aguiEnviron() { return *_NSGetEnviron(); }
+#else
+extern char **environ;
+static char** aguiEnviron() { return environ; }
+#endif
+#endif
+
+static int runDetached(const std::vector<std::string>& argv) {
+    if (argv.empty()) return -1;
+#ifdef _WIN32
+    std::wstring cmd;
+    for (size_t i = 0; i < argv.size(); ++i) {
+        if (i > 0) cmd += L' ';
+        win32AppendArg(cmd, argv[i]);
+    }
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi = {};
+    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE,
+                         CREATE_NO_WINDOW | DETACHED_PROCESS,
+                         nullptr, nullptr, &si, &pi))
+        return -1;
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return (int)code;
+#else
+    std::vector<char*> args;
+    args.reserve(argv.size() + 1);
+    for (const std::string& a : argv) args.push_back(const_cast<char*>(a.c_str()));
+    args.push_back(nullptr);
+    pid_t pid = -1;
+    if (posix_spawnp(&pid, args[0], nullptr, nullptr, args.data(), aguiEnviron()) != 0)
+        return -1;
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) return -1;
+    }
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    return -1;
+#endif
+}
+
+// Fire-and-forget launch on a detached thread.
+static void launchDetached(const std::vector<std::string>& argv) {
+    std::thread([argv] { (void)runDetached(argv); }).detach();
 }
 
 static std::string errorString(int code) {
@@ -161,18 +263,93 @@ static std::string errorString(int code) {
     }
 }
 
-// Fire-and-forget shell command on a detached thread.
-static void spawnShell(const std::string& cmd) {
-    std::thread([cmd] { int rc = std::system(cmd.c_str()); (void)rc; }).detach();
+#ifdef _WIN32
+static std::mutex g_notifyMutex;
+
+// Message-only window hosting our notification-area icon, created lazily so
+// notifications work even before (or without) the main SDL window.
+static HWND win32NotifyHost() {
+    static HWND hwnd = nullptr;
+    static std::once_flag once;
+    std::call_once(once, [] {
+        WNDCLASSW wc = {};
+        wc.lpfnWndProc = DefWindowProcW;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = L"AguiNotifyHost";
+        if (RegisterClassW(&wc)) {
+            hwnd = CreateWindowExW(0, wc.lpszClassName, L"agui", 0,
+                                   0, 0, 0, 0, HWND_MESSAGE, nullptr,
+                                   wc.hInstance, nullptr);
+        }
+    });
+    return hwnd;
 }
+
+// Balloon notification via our own tray icon. The icon is removed a few
+// seconds after the balloon is shown.
+static void win32NotifyBalloon(const std::string& title, const std::string& msg) {
+    HWND hwnd = win32NotifyHost();
+    if (!hwnd) return;
+    std::wstring wTitle = win32Widen(title);
+    std::wstring wMsg = win32Widen(msg);
+    NOTIFYICONDATAW nid = {};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = hwnd;
+    nid.uID = 1;
+    {
+        std::lock_guard<std::mutex> lock(g_notifyMutex);
+        nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+        nid.uCallbackMessage = WM_APP + 101;
+        nid.hIcon = LoadIconW(nullptr, (LPCWSTR)(ULONG_PTR)IDI_APPLICATION);
+        wcsncpy(nid.szTip, L"agui", ARRAYSIZE(nid.szTip));
+        Shell_NotifyIconW(NIM_ADD, &nid);
+        nid.uFlags = NIF_INFO;
+        wcsncpy(nid.szInfo, wMsg.c_str(), ARRAYSIZE(nid.szInfo) - 1);
+        wcsncpy(nid.szInfoTitle, wTitle.c_str(), ARRAYSIZE(nid.szInfoTitle) - 1);
+        nid.dwInfoFlags = NIIF_INFO;
+        Shell_NotifyIconW(NIM_MODIFY, &nid);
+    }
+    Sleep(6000);
+    {
+        std::lock_guard<std::mutex> lock(g_notifyMutex);
+        Shell_NotifyIconW(NIM_DELETE, &nid);
+    }
+}
+#endif
+
+#if defined(__APPLE__)
+static std::string appleScriptEscape(const std::string& s) {
+    std::string r;
+    for (char ch : s) {
+        if (ch == '\\' || ch == '"') r += '\\';
+        r += ch;
+    }
+    return r;
+}
+#endif
 
 static void desktopNotify(const std::string& title, const std::string& msg) {
-    spawnShell("command -v notify-send >/dev/null 2>&1 && notify-send " +
-               shellQuote(title) + " " + shellQuote(msg));
+#ifdef _WIN32
+    std::thread([title, msg] { win32NotifyBalloon(title, msg); }).detach();
+#elif defined(__APPLE__)
+    launchDetached({"/usr/bin/osascript", "-e",
+                    "display notification \"" + appleScriptEscape(msg) +
+                    "\" with title \"" + appleScriptEscape(title) + "\""});
+#else
+    launchDetached({"notify-send", title, msg});
+#endif
 }
 
-static void openWithXdg(const std::string& target) {
-    spawnShell("command -v xdg-open >/dev/null 2>&1 && xdg-open " + shellQuote(target));
+static void openPathOrUrl(const std::string& target) {
+    if (target.empty()) return;
+#ifdef _WIN32
+    std::wstring w = win32Widen(target);
+    ShellExecuteW(nullptr, L"open", w.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+#elif defined(__APPLE__)
+    launchDetached({"/usr/bin/open", target});
+#else
+    launchDetached({"xdg-open", target});
+#endif
 }
 
 // ============================================================================
@@ -469,15 +646,37 @@ static void doAria2() {
 }
 
 // ============================================================================
-// Config persistence (~/.config/agui/config)
+// Config persistence (per-platform location via SDL_GetPrefPath, with
+// migration from the historical ~/.config/agui/config on POSIX systems)
 // ============================================================================
 
-static std::filesystem::path configPath() {
+static std::filesystem::path legacyConfigPath() {
     const char* xdg = getenv("XDG_CONFIG_HOME");
     if (xdg && *xdg) return std::filesystem::path(xdg) / "agui" / "config";
     const char* home = getenv("HOME");
     if (home && *home) return std::filesystem::path(home) / ".config" / "agui" / "config";
     return "agui.config";
+}
+
+static const std::filesystem::path& configPath() {
+    static const std::filesystem::path p = [] {
+        std::error_code ec;
+        char* pref = SDL_GetPrefPath("agui", "agui");
+        std::filesystem::path modern;
+        if (pref) {
+            modern = std::filesystem::path(pref) / "config";
+            SDL_free(pref);
+        }
+        if (!modern.empty()) {
+            // Keep existing setups where they are.
+            if (std::filesystem::exists(modern, ec)) return modern;
+            std::filesystem::path legacy = legacyConfigPath();
+            if (std::filesystem::exists(legacy, ec)) return legacy;
+            return modern;
+        }
+        return legacyConfigPath();
+    }();
+    return p;
 }
 
 static void loadConfig() {
@@ -952,10 +1151,10 @@ static void drawDownloadCard(const DownloadInfo& d) {
             }
             break;
         case Action::OpenFile:
-            openWithXdg(d.path);
+            openPathOrUrl(d.path);
             break;
         case Action::OpenFolder:
-            openWithXdg(d.path.empty() ? g_downloadFolder : directoryOf(d.path));
+            openPathOrUrl(d.path.empty() ? g_downloadFolder : directoryOf(d.path));
             break;
         case Action::Retry:
             {
@@ -1253,7 +1452,7 @@ static void SDLCALL onTrayEntry(void* userdata, SDL_TrayEntry* /*entry*/) {
     case TrayAction::Toggle:     requestToggleWindow(); break;
     case TrayAction::PauseAll:   enqueueCommand(CmdType::PauseAll, std::string()); break;
     case TrayAction::ResumeAll:  enqueueCommand(CmdType::ResumeAll, std::string()); break;
-    case TrayAction::OpenFolder: openWithXdg(g_downloadFolder); break;
+    case TrayAction::OpenFolder: openPathOrUrl(g_downloadFolder); break;
     case TrayAction::Quit:       requestQuit(); break;
     }
 }
@@ -1393,6 +1592,53 @@ static bool startSystemTray() {
 }
 
 // ============================================================================
+// Headless platform self-test (agui --self-test). Exercises the platform
+// layer without a display; CI runs it on Linux, macOS and Windows.
+// ============================================================================
+
+static bool checkSelfTest(const char* what, const std::string& got, const std::string& want) {
+    bool ok = (got == want);
+    printf("[self-test] %-14s got='%s' want='%s' %s\n",
+           what, got.c_str(), want.c_str(), ok ? "OK" : "FAIL");
+    return ok;
+}
+
+static bool runSelfTest() {
+    bool ok = true;
+    printf("[self-test] imgui=%s sdl=%d\n", ImGui::GetVersion(), SDL_GetVersion());
+    printf("[self-test] config-path=%s\n", configPath().string().c_str());
+    ok &= !configPath().empty();
+
+#ifdef _WIN32
+    ok &= checkSelfTest("basename", baseNameOf("C:\\Users\\x\\file.txt"), "file.txt");
+    ok &= checkSelfTest("dirname", directoryOf("C:\\Users\\x\\file.txt"), "C:\\Users\\x");
+    ok &= checkSelfTest("sep-forward", baseNameOf("C:/Users/x/file.txt"), "file.txt");
+    printf("[self-test] open=ShellExecuteW\n");
+    printf("[self-test] notify=tray-balloon\n");
+    launchDetached({"cmd.exe", "/c", "exit", "0"}); // exercise the async spawn path
+    int rc = runDetached({"cmd.exe", "/c", "exit", "0"});
+#else
+#ifdef __APPLE__
+    printf("[self-test] open=/usr/bin/open\n");
+    printf("[self-test] notify=/usr/bin/osascript\n");
+#else
+    printf("[self-test] open=xdg-open\n");
+    printf("[self-test] notify=notify-send\n");
+#endif
+    ok &= checkSelfTest("basename", baseNameOf("/home/x/file.txt"), "file.txt");
+    ok &= checkSelfTest("dirname", directoryOf("/home/x/file.txt"), "/home/x");
+    int rc = runDetached({"true"});
+#endif
+    printf("[self-test] spawn-exit=%d %s\n", rc, rc == 0 ? "OK" : "FAIL");
+    ok &= (rc == 0);
+    int rcBad = runDetached({"agui-missing-helper-xyz"});
+    printf("[self-test] spawn-missing=%d %s\n", rcBad, rcBad != 0 ? "OK" : "FAIL");
+    ok &= (rcBad != 0);
+    printf("[self-test] %s\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+// ============================================================================
 // main
 // ============================================================================
 
@@ -1401,9 +1647,12 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--hidden") == 0 || strcmp(argv[i], "--tray") == 0) {
             startHidden = true;
+        } else if (strcmp(argv[i], "--self-test") == 0) {
+            return runSelfTest() ? 0 : 1;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            printf("usage: agui [--hidden]\n"
-                   "  --hidden, --tray   start minimized to the system tray\n");
+            printf("usage: agui [--hidden] [--self-test]\n"
+                   "  --hidden, --tray   start minimized to the system tray\n"
+                   "  --self-test        run headless platform checks and exit\n");
             return 0;
         }
     }

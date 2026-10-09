@@ -48,7 +48,10 @@ jobs:
             build-essential cmake ninja-build pkg-config \
             libaria2-0-dev libgl1-mesa-dev \
             libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev \
-            libxi-dev libxss-dev libxkbcommon-dev libwayland-dev \
+            libxi-dev libxss-dev libxtst-dev libxkbcommon-dev \
+            libxinerama-dev libxxf86vm-dev libxrender-dev \
+            libwayland-dev wayland-protocols libdecor-0-dev \
+            libdrm-dev libgbm-dev \
             libpipewire-0.3-dev libpulse-dev libasound2-dev \
             libdbus-1-dev libudev-dev libibus-1.0-dev
 
@@ -74,6 +77,9 @@ jobs:
 
       - name: Smoke test
         run: ./build/agui --help
+
+      - name: Platform self-test
+        run: ./build/agui --self-test
 
       - name: Package
         run: |
@@ -130,6 +136,9 @@ jobs:
       - name: Smoke test
         run: ./build/agui --help
 
+      - name: Platform self-test
+        run: ./build/agui --self-test
+
       - name: Package
         run: |
           mkdir -p dist
@@ -176,6 +185,9 @@ jobs:
 
       - name: Smoke test
         run: ./build/agui.exe --help
+
+      - name: Platform self-test
+        run: ./build/agui.exe --self-test
 
       - name: Package
         run: |
